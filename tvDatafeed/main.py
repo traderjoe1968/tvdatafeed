@@ -39,13 +39,15 @@ class TvDatafeed:
     __sign_in_totp = 'https://www.tradingview.com/accounts/two-factor/signin/totp/'
     __search_url = 'https://symbol-search.tradingview.com/symbol_search/?text={}&hl=1&exchange={}&lang=en&type=&domain=production'
     __ws_headers = json.dumps({"Origin": "https://data.tradingview.com"})
+    __ws_proheaders = json.dumps({"Origin": "https://prodata.tradingview.com"})
     __signin_headers = {'Referer': 'https://www.tradingview.com'}
-    __ws_timeout = 5
+    __ws_timeout = 10
 
     def __init__(
         self,
         username: str = None,
         password: str = None,
+        pro: bool = False,
     ) -> None:
         """Create TvDatafeed object
 
@@ -56,6 +58,8 @@ class TvDatafeed:
 
         self.ws_debug = False
 
+        self.pro = pro
+                
         self.token = self.__auth(username, password)
 
         if self.token is None:
@@ -113,9 +117,10 @@ class TvDatafeed:
     
     def __create_connection(self):
         logging.debug("creating websocket connection")
-        self.ws = create_connection(
-            "wss://data.tradingview.com/socket.io/websocket", headers=self.__ws_headers, timeout=self.__ws_timeout
-        )
+        if self.pro:
+            self.ws = create_connection("wss://prodata.tradingview.com/socket.io/websocket", headers=self.__ws_proheaders, timeout=self.__ws_timeout)
+        else:
+             self.ws = create_connection("wss://data.tradingview.com/socket.io/websocket", headers=self.__ws_headers, timeout=self.__ws_timeout)
 
     @staticmethod
     def __filter_raw_message(text):
