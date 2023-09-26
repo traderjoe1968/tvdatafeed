@@ -9,9 +9,14 @@ import pandas as pd
 from websocket import create_connection
 import requests
 import json
+from pathlib import Path
+from appdirs import user_data_dir
 
 logger = logging.getLogger(__name__)
 
+
+tokendata = Path(user_data_dir(appname="tvdata", appauthor=""), "token.2fa")
+tokendata.parent.mkdir(parents=True, exist_ok=True) 
 
 class Interval(enum.Enum):
     in_1_minute = "1"
@@ -31,6 +36,7 @@ class Interval(enum.Enum):
 
 class TvDatafeed:
     __sign_in_url = 'https://www.tradingview.com/accounts/signin/'
+    __sign_in_totp = 'https://www.tradingview.com/accounts/two-factor/signin/totp/'
     __search_url = 'https://symbol-search.tradingview.com/symbol_search/?text={}&hl=1&exchange={}&lang=en&type=&domain=production'
     __ws_headers = json.dumps({"Origin": "https://data.tradingview.com"})
     __signin_headers = {'Referer': 'https://www.tradingview.com'}
@@ -63,24 +69,48 @@ class TvDatafeed:
         self.chart_session = self.__generate_chart_session()
 
     def __auth(self, username, password):
-
-        if (username is None or password is None):
-            token = None
-
-        else:
-            data = {"username": username,
-                    "password": password,
-                    "remember": "on"}
-            try:
-                response = requests.post(
-                    url=self.__sign_in_url, data=data, headers=self.__signin_headers)
-                token = response.json()['user']['auth_token']
-            except Exception as e:
-                logger.error('error while signin')
+        
+        try:
+            with open(tokendata, 'r') as f:
+                token = f.read()
+        except IOError:
+            if (username is None or password is None):
                 token = None
+
+            else:
+                data = {"username": username,
+                        "password": password,
+                        "remember": "on"}
+                try:
+                    with requests.Session() as s:
+                        response = s.post(url=self.__sign_in_url, data=data, headers=self.__signin_headers)
+                        # '{"error":"2FA_required","code":"2FA_required","message":"Second authentication factor is needed","two_factor_types":[{"name":"totp"}]}'
+                        if "2FA_required" in response.text:
+                            response = s.post(url=self.__sign_in_totp, data={"code": self.__getcode()}, headers=self.__signin_headers)
+                            token = response.json()['user']['auth_token']
+                            with open(tokendata, 'w') as f:
+                                    f.write(token)
+                        else:
+                            token = response.json()['user']['auth_token']
+
+                except Exception as e:
+                    logger.error('error while signin')
+                    token = None
 
         return token
 
+    @staticmethod
+    def __getcode():
+        print("Asking user for 2FA code")
+        code = input("Enter 2FA code: ")
+        return int(code)
+    
+    @staticmethod
+    def __delete_token():
+        self.token = None
+        tokendata.unlink()
+        raise Exception("error with token - exiting")    
+    
     def __create_connection(self):
         logging.debug("creating websocket connection")
         self.ws = create_connection(
@@ -281,6 +311,7 @@ class TvDatafeed:
                 result = self.ws.recv()
                 raw_data = raw_data + result + "\n"
             except Exception as e:
+                self.__delete_token()
                 logger.error(e)
                 break
 
@@ -299,6 +330,7 @@ class TvDatafeed:
             symbols_list = json.loads(resp.text.replace(
                 '</em>', '').replace('<em>', ''))
         except Exception as e:
+            self.__delete_token()
             logger.error(e)
 
         return symbols_list
