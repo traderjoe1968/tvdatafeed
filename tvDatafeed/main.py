@@ -338,7 +338,6 @@ class TvDatafeed:
             symbols_list = json.loads(resp.text.replace(
                 '</em>', '').replace('<em>', ''))
         except Exception as e:
-            self.__delete_token()
             logger.error(e)
 
         return symbols_list
