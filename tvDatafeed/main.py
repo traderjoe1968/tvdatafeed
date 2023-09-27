@@ -6,7 +6,7 @@ import random
 import re
 import string
 import pandas as pd
-from websocket import create_connection
+from websocket import create_connection, WebSocketTimeoutException
 import requests
 import json
 from pathlib import Path
@@ -47,7 +47,7 @@ class TvDatafeed:
         self,
         username: str = None,
         password: str = None,
-        pro: bool = False,
+        pro: bool =False
     ) -> None:
         """Create TvDatafeed object
 
@@ -111,8 +111,8 @@ class TvDatafeed:
     
     @staticmethod
     def __delete_token():
-        self.token = None
         tokendata.unlink()
+        self.token = None
         raise Exception("error with token - exiting")    
     
     def __create_connection(self):
@@ -315,6 +315,9 @@ class TvDatafeed:
             try:
                 result = self.ws.recv()
                 raw_data = raw_data + result + "\n"
+            except WebSocketTimeoutException as e:
+                logger.error(e)
+                break
             except Exception as e:
                 self.__delete_token()
                 logger.error(e)
