@@ -2,6 +2,7 @@ import datetime
 import enum
 import json
 import logging
+import os
 import random
 import re
 import string
@@ -86,16 +87,25 @@ class TvDatafeed:
                         "password": password,
                         "remember": "on"}
                 try:
-                    with requests.Session() as s:
-                        response = s.post(url=self.__sign_in_url, data=data, headers=self.__signin_headers)
-                        # '{"error":"2FA_required","code":"2FA_required","message":"Second authentication factor is needed","two_factor_types":[{"name":"totp"}]}'
-                        if "2FA_required" in response.text:
-                            response = s.post(url=self.__sign_in_totp, data={"code": self.__getcode()}, headers=self.__signin_headers)
-                            token = response.json()['user']['auth_token']
-                            with open(tokendata, 'w') as f:
-                                    f.write(token)
-                        else:
-                            token = response.json()['user']['auth_token']
+
+                    if os.path.exists('token.txt'):
+                        # Token aus einer Datei lesen
+                        with open('token.txt', 'r') as f:
+                            token = f.read()
+                    else:
+                        with requests.Session() as s:
+                            response = s.post(url=self.__sign_in_url, data=data, headers=self.__signin_headers)
+                            # '{"error":"2FA_required","code":"2FA_required","message":"Second authentication factor is needed","two_factor_types":[{"name":"totp"}]}'
+                            if "2FA_required" in response.text:
+                                response = s.post(url=self.__sign_in_totp, data={"code": self.__getcode()}, headers=self.__signin_headers)
+                                token = response.json()['user']['auth_token']
+                                with open(tokendata, 'w') as f:
+                                        f.write(token)
+                            else:
+                                token = response.json()['user']['auth_token']
+
+                            with open('token.txt', 'w') as f:
+                                f.write(token)
 
                 except Exception as e:
                     logger.error('error while signin')
