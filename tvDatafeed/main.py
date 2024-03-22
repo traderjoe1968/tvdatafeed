@@ -98,7 +98,7 @@ class TvDatafeed:
                             token = response.json()['user']['auth_token']
 
                 except Exception as e:
-                    logger.error('error while signin')
+                    logger.error(f'Error during login - server response {response.json()}')
                     token = None
 
         return token
