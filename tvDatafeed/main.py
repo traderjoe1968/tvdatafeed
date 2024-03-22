@@ -227,6 +227,7 @@ class TvDatafeed:
         interval: Interval = Interval.in_daily,
         n_bars: int = 10,
         fut_contract: int = None,
+        fut_badj: bool = True,
         extended_session: bool = False,
     ) -> pd.DataFrame:
         """get historical data
@@ -288,16 +289,17 @@ class TvDatafeed:
                                   {"flags": ["force_permission"]}]
         )
         self.__send_message("quote_fast_symbols", [self.session, symbol])
-
+        
+        adj_msg = '","adjustment":"splits",' if fut_contract is None else '"backadjustment":"default",' if fut_badj else ''
         self.__send_message(
             "resolve_symbol",
             [
                 self.chart_session,
                 "symbol_1",
                 '={"symbol":"'
-                + symbol
-                + '","adjustment":"splits","session":'
-                + ('"regular"' if not extended_session else '"extended"')
+                + symbol + '",'
+                + adj_msg
+                + '"session":'+('"regular"' if not extended_session else '"extended"')
                 + "}",
             ],
         )
