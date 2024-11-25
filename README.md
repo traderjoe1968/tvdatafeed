@@ -66,12 +66,26 @@ To download the data use `tv.get_hist` method.
 It accepts following arguments and returns pandas dataframe
 
 ```python
-(symbol: str, exchange: str = 'NSE', interval: Interval = Interval.in_daily, n_bars: int = 10, fut_contract: int | None = None, extended_session: bool = False) -> DataFrame)
+(symbol: str|List[str], exchange: str = 'NSE', interval: Interval = Interval.in_daily, n_bars: int = 10, dataFrame: bool = True, fut_contract: int | None = None, extended_session: bool = False) -> pd.DataFrame|Dict[str, List[List]|pd.DataFrame]|List[List])
 ```
+
+By default, `dataFrame` is set to True to get pandas DataDrame, if False it will return data in list format.
+
+Note: If symbol (str) given it will return DataFrame or List of historical data of the symbol.
+	If List of symbols is passed to `tv.get_hist` it will return python Dictionary in {'symbol': Data, ......} format.
+	For multiple symbols, it fetches data asynchronously to get faster results.
 
 for example-
 
 ```python
+symbols = ['SBIN', 'EICHERMOT', 'INFY', 'BHARTIARTL', 'NESTLEIND', 'ASIANPAINT', 'ITC']
+
+# returns {symbol1: pd DataFrame, symbol2: pd DataFrame, .....}
+results = tv.get_hist(symbols, "NSE", n_bars=500)
+
+# returns {symbol1: [[Timestamp, open, high, low, close, volume], .....], symbol2:  [[Timestamp, open, high, low, close, volume], .....], .....}
+results = tv.get_hist(symbols, "NSE", n_bars=500, dataFrame=False)
+
 # index
 nifty_index_data = tv.get_hist(symbol='NIFTY',exchange='NSE',interval=Interval.in_1_hour,n_bars=1000)
 
