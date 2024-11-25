@@ -1,4 +1,4 @@
 setuptools~=49.2.0
 pandas~=1.0.5
-websocket-client~=0.57.0
+websockets~=14.1
 requests
