@@ -63,7 +63,8 @@ when using without login, following warning will be shown `you are using nologin
 
 To download the data use `tv.get_hist` method.
 
-It accepts following arguments and returns pandas dataframe if `dataFrame` is set to True to get pandas DataDrame, if False it will return data in list format
+It accepts following arguments and returns pandas dataframe if `dataFrame` is set to True (default) to get pandas DataDrame, if False it will return data in list format
+
 
 ```python
 (symbol: str|List[str], exchange: str = 'NSE', interval: Interval = Interval.in_daily, n_bars: int = 10, dataFrame: bool = True, fut_contract: int | None = None, extended_session: bool = False) -> pd.DataFrame|Dict[str, List[List]|pd.DataFrame]|List[List])
