@@ -98,6 +98,12 @@ crudeoil_data = tv.get_hist(symbol='CRUDEOIL',exchange='MCX',interval=Interval.i
 extended_price_data = tv.get_hist(symbol="EICHERMOT",exchange="NSE",interval=Interval.in_1_hour,n_bars=500, extended_session=False)
 ```
 
+To use in Ipython notebooks, add these lines at first
+```python
+import nest_asyncio  # To run asyncio in a notebook environment
+nest_asyncio.apply()  # Enable asyncio in a notebook environment
+```
+
 ---
 
 ## Search Symbol
