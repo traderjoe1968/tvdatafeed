@@ -255,7 +255,7 @@ class TvDatafeed:
     async def get_hist_async(self, symbols: list[str], exchange: str = "NSE", interval: Interval = Interval.in_daily, n_bars: int = 10, dataFrame: bool = True, fut_contract: int = None, extended_session: bool = False) -> Dict[str, List[List]|pd.DataFrame]:
         """Fetch historical data for multiple symbols asynchronously."""
         tasks = [
-            self.__fetch_symbol_data(symbol, exchange, interval, n_bars, fut_contract, extended_session, dataFrame)
+            asyncio.create_task(self.__fetch_symbol_data(symbol, exchange, interval, n_bars, fut_contract, extended_session, dataFrame))
             for symbol in symbols
         ]
         results = await asyncio.gather(*tasks)
