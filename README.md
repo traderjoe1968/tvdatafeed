@@ -34,6 +34,9 @@ Full tutorial
 
 Version 2.0.0 is a major release and is not backward compatible. make sure you update your code accordingly. Thanks to [stefanomorni](https://github.com/stefanomorni) for contributing and removing selenium dependancy.
 
+### Appreciation
+Original ***[ProData](https://github.com/traderjoe1968/tvdatafeed/tree/ProData)*** code was implementer, thanks to **`@traderjoe1968`**.
+
 ## Usage
 
 Import the packages and initialize with your tradingview username and password.
@@ -41,11 +44,14 @@ Import the packages and initialize with your tradingview username and password.
 ```python
 from tvDatafeed import TvDatafeed, Interval
 
-username = 'YourTradingViewUsername'
-password = 'YourTradingViewPassword'
+username: str = 'YourTradingViewUsername'
+password: str = 'YourTradingViewPassword'
+pro: bool = True  # if subscribed to paid plans else False (default)
 
-tv = TvDatafeed(username, password)
+tv = TvDatafeed(username, password, pro)
 ```
+
+You can store your accounts `2FA TOTP key` in **.env** file as <u>TOTP_KEY=*YOUR TOTP KEY*</u> if your to fully automate the process or type `totp` when asked.
 
 You may use without logging in, but in some cases tradingview may limit the symbols and some symbols might not be available.
 
