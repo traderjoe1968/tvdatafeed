@@ -34,6 +34,9 @@ Full tutorial
 
 Version 2.0.0 is a major release and is not backward compatible. make sure you update your code accordingly. Thanks to [stefanomorni](https://github.com/stefanomorni) for contributing and removing selenium dependancy.
 
+### Appreciation
+Original ***[ProData](https://github.com/traderjoe1968/tvdatafeed/tree/ProData)*** code was implementer, thanks to **`@traderjoe1968`**.
+
 ## Usage
 
 Import the packages and initialize with your tradingview username and password.
@@ -41,11 +44,14 @@ Import the packages and initialize with your tradingview username and password.
 ```python
 from tvDatafeed import TvDatafeed, Interval
 
-username = 'YourTradingViewUsername'
-password = 'YourTradingViewPassword'
+username: str = 'YourTradingViewUsername'
+password: str = 'YourTradingViewPassword'
+pro: bool = True  # if subscribed to paid plans else False (default)
 
-tv = TvDatafeed(username, password)
+tv = TvDatafeed(username, password, pro)
 ```
+
+You can store your accounts `2FA TOTP key` in **.env** file as <u>TOTP_KEY=*YOUR TOTP KEY*</u> if your to fully automate the process or type `totp` when asked.
 
 You may use without logging in, but in some cases tradingview may limit the symbols and some symbols might not be available.
 
@@ -63,15 +69,28 @@ when using without login, following warning will be shown `you are using nologin
 
 To download the data use `tv.get_hist` method.
 
-It accepts following arguments and returns pandas dataframe
+It accepts following arguments and returns pandas dataframe if `dataFrame` is set to True (default) to get pandas DataDrame, if False it will return data in list format
+
 
 ```python
-(symbol: str, exchange: str = 'NSE', interval: Interval = Interval.in_daily, n_bars: int = 10, fut_contract: int | None = None, extended_session: bool = False) -> DataFrame)
+(symbol: str|List[str], exchange: str = 'NSE', interval: Interval = Interval.in_daily, n_bars: int = 10, dataFrame: bool = True, fut_contract: int | None = None, extended_session: bool = False) -> pd.DataFrame|Dict[str, List[List]|pd.DataFrame]|List[List])
 ```
+
+Note: If symbol (str) given it will return DataFrame or List of historical data of the symbol.
+	If List of symbols is passed to `tv.get_hist` it will return python Dictionary in {'symbol': Data, ......} format.
+	For multiple symbols, it fetches data asynchronously to get faster results.
 
 for example-
 
 ```python
+symbols = ['SBIN', 'EICHERMOT', 'INFY', 'BHARTIARTL', 'NESTLEIND', 'ASIANPAINT', 'ITC']
+
+# returns {symbol1: pd DataFrame, symbol2: pd DataFrame, .....}
+results = tv.get_hist(symbols, "NSE", n_bars=500)
+
+# returns {symbol1: [[Timestamp, open, high, low, close, volume], .....], symbol2:  [[Timestamp, open, high, low, close, volume], .....], .....}
+results = tv.get_hist(symbols, "NSE", n_bars=500, dataFrame=False)
+
 # index
 nifty_index_data = tv.get_hist(symbol='NIFTY',exchange='NSE',interval=Interval.in_1_hour,n_bars=1000)
 
@@ -83,6 +102,12 @@ crudeoil_data = tv.get_hist(symbol='CRUDEOIL',exchange='MCX',interval=Interval.i
 
 # downloading data for extended market hours
 extended_price_data = tv.get_hist(symbol="EICHERMOT",exchange="NSE",interval=Interval.in_1_hour,n_bars=500, extended_session=False)
+```
+
+To use in Ipython notebooks, add these lines at first
+```python
+import nest_asyncio  # To run asyncio in a notebook environment
+nest_asyncio.apply()  # Enable asyncio in a notebook environment
 ```
 
 ---
