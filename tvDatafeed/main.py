@@ -5,18 +5,22 @@ import logging
 import random
 import re
 import string
+from typing import Dict, List
 import pandas as pd
+import asyncio
 from websocket import create_connection, WebSocketTimeoutException
 import requests
 import json
-from pathlib import Path
-from appdirs import user_data_dir
+from dotenv import load_dotenv
+from os import getenv
+import pyotp
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 
-tokendata = Path(user_data_dir(appname="tvdata", appauthor=""), "token.2fa")
-tokendata.parent.mkdir(parents=True, exist_ok=True) 
+tokendata = "token.txt"
+
 
 class Interval(enum.Enum):
     in_1_minute = "1"
@@ -38,8 +42,8 @@ class TvDatafeed:
     __sign_in_url = 'https://www.tradingview.com/accounts/signin/'
     __sign_in_totp = 'https://www.tradingview.com/accounts/two-factor/signin/totp/'
     __search_url = 'https://symbol-search.tradingview.com/symbol_search/?text={}&hl=1&exchange={}&lang=en&type=&domain=production'
-    __ws_headers = json.dumps({"Origin": "https://data.tradingview.com"})
-    __ws_proheaders = json.dumps({"Origin": "https://prodata.tradingview.com"})
+    __ws_headers = {"Origin": "https://data.tradingview.com"}
+    __ws_proheaders = {"Origin": "https://prodata.tradingview.com"}
     __signin_headers = {'Referer': 'https://www.tradingview.com'}
     __ws_timeout = 10
 
@@ -88,8 +92,7 @@ class TvDatafeed:
                 try:
                     with requests.Session() as s:
                         response = s.post(url=self.__sign_in_url, data=data, headers=self.__signin_headers)
-                        # '{"error":"2FA_required","code":"2FA_required","message":"Second authentication factor is needed","two_factor_types":[{"name":"totp"}]}'
-                        if "2FA_required" in response.text:
+                        if "2FA" in response.text:
                             response = s.post(url=self.__sign_in_totp, data={"code": self.__getcode()}, headers=self.__signin_headers)
                             token = response.json()['user']['auth_token']
                             with open(tokendata, 'w') as f:
@@ -98,20 +101,21 @@ class TvDatafeed:
                             token = response.json()['user']['auth_token']
 
                 except Exception as e:
-                    logger.error('error while signin')
+                    logger.error('error while signin', e)
                     token = None
 
         return token
 
     @staticmethod
     def __getcode():
-        print("Asking user for 2FA code")
+        totp_key = getenv('TOTP_KEY', None)
+        if totp_key:
+            return pyotp.TOTP(totp_key).now()
+        
         code = input("Enter 2FA code: ")
-        return int(code)
+        return code
     
-    @staticmethod
-    def __delete_token():
-        tokendata.unlink()
+    def __delete_token(self):
         self.token = None
         raise Exception("error with token - exiting")    
     
@@ -121,16 +125,6 @@ class TvDatafeed:
             self.ws = create_connection("wss://prodata.tradingview.com/socket.io/websocket", headers=self.__ws_proheaders, timeout=self.__ws_timeout)
         else:
              self.ws = create_connection("wss://data.tradingview.com/socket.io/websocket", headers=self.__ws_headers, timeout=self.__ws_timeout)
-
-    @staticmethod
-    def __filter_raw_message(text):
-        try:
-            found = re.search('"m":"(.+?)",', text).group(1)
-            found2 = re.search('"p":(.+?"}"])}', text).group(1)
-
-            return found, found2
-        except AttributeError:
-            logger.error("error in filter_raw_message")
 
     @staticmethod
     def __generate_session():
@@ -166,16 +160,16 @@ class TvDatafeed:
         self.ws.send(m)
 
     @staticmethod
-    def __create_df(raw_data, symbol):
+    def __parse_data(raw_data, is_return_dataframe:bool) -> List[List]:
         try:
-            out = re.search('"s":\[(.+?)\}\]', raw_data).group(1)
+            out = re.search(r""""s":\[(.+?)\}\]""", raw_data).group(1)
             x = out.split(',{"')
             data = list()
             volume_data = True
 
             for xi in x:
-                xi = re.split("\[|:|,|\]", xi)
-                ts = datetime.datetime.fromtimestamp(float(xi[4]))
+                xi = re.split(r"\[|:|,|\]", xi)
+                ts = datetime.datetime.fromtimestamp(float(xi[4])) if is_return_dataframe else int(xi[4].split('.')[0])
 
                 row = [ts]
 
@@ -195,14 +189,23 @@ class TvDatafeed:
 
                 data.append(row)
 
-            data = pd.DataFrame(
+            return data
+        except Exception as e:
+            logger.exception(e)
+    
+    @staticmethod
+    def __create_df(data, symbol):
+        try:
+            df = pd.DataFrame(
                 data, columns=["datetime", "open",
                                "high", "low", "close", "volume"]
             ).set_index("datetime")
-            data.insert(0, "symbol", value=symbol)
-            return data
+            df.insert(0, "symbol", value=symbol)
+            return df
         except AttributeError:
             logger.error("no data, please check the exchange and symbol")
+        except Exception as e:
+            logger.exception(e)
 
     @staticmethod
     def __format_symbol(symbol, exchange, contract: int = None):
@@ -219,35 +222,8 @@ class TvDatafeed:
             raise ValueError("not a valid contract")
 
         return symbol
-
-    def get_hist(
-        self,
-        symbol: str,
-        exchange: str = "NSE",
-        interval: Interval = Interval.in_daily,
-        n_bars: int = 10,
-        fut_contract: int = None,
-        extended_session: bool = False,
-    ) -> pd.DataFrame:
-        """get historical data
-
-        Args:
-            symbol (str): symbol name
-            exchange (str, optional): exchange, not required if symbol is in format EXCHANGE:SYMBOL. Defaults to None.
-            interval (str, optional): chart interval. Defaults to 'D'.
-            n_bars (int, optional): no of bars to download, max 5000. Defaults to 10.
-            fut_contract (int, optional): None for cash, 1 for continuous current contract in front, 2 for continuous next contract in front . Defaults to None.
-            extended_session (bool, optional): regular session if False, extended session if True, Defaults to False.
-
-        Returns:
-            pd.Dataframe: dataframe with sohlcv as columns
-        """
-        symbol = self.__format_symbol(
-            symbol=symbol, exchange=exchange, contract=fut_contract
-        )
-
-        interval = interval.value
-
+    
+    def __initialize_ws(self):
         self.__create_connection()
 
         self.__send_message("set_auth_token", [self.token])
@@ -282,6 +258,37 @@ class TvDatafeed:
                 "rtc",
             ],
         )
+
+    async def __fetch_symbol_data(
+        self,
+        symbol: str,
+        exchange: str = "NSE",
+        interval: Interval = Interval.in_daily,
+        n_bars: int = 10,
+        fut_contract: int = None,
+        extended_session: bool = False,
+        dataFrame: bool = True
+    ) -> pd.DataFrame | List[List]:
+        """get single symbol historical data
+
+        Args:
+            symbol (str): symbol name
+            exchange (str, optional): exchange, not required if symbol is in format EXCHANGE:SYMBOL. Defaults to None.
+            interval (str, optional): chart interval. Defaults to 'D'.
+            n_bars (int, optional): no of bars to download, max 5000. Defaults to 10.
+            fut_contract (int, optional): None for cash, 1 for continuous current contract in front, 2 for continuous next contract in front . Defaults to None.
+            extended_session (bool, optional): regular session if False, extended session if True, Defaults to False.
+
+        Returns:
+            pd.Dataframe: dataframe with sohlcv as columns
+        """
+        symbol = self.__format_symbol(
+            symbol=symbol, exchange=exchange, contract=fut_contract
+        )
+
+        interval = interval.value
+
+        self.__initialize_ws()
 
         self.__send_message(
             "quote_add_symbols", [self.session, symbol,
@@ -326,7 +333,60 @@ class TvDatafeed:
             if "series_completed" in result:
                 break
 
-        return self.__create_df(raw_data, symbol)
+        # Return formatted data
+        if dataFrame:
+            parsed_data = self.__parse_data(raw_data, dataFrame)
+            return self.__create_df(parsed_data, symbol)
+        else:
+            return self.__parse_data(raw_data, dataFrame)
+        
+    async def get_hist_async(
+            self,
+            symbols: list[str],
+            exchange: str = "NSE",
+            interval: Interval = Interval.in_daily,
+            n_bars: int = 10,
+            fut_contract: int = None,
+            extended_session: bool = False,
+            dataFrame: bool = True,
+        ) -> Dict[str, List[List]|pd.DataFrame]:
+        """Fetch historical data for multiple symbols asynchronously."""
+        tasks = [
+            asyncio.create_task(self.__fetch_symbol_data(symbol, exchange, interval, n_bars, fut_contract, extended_session, dataFrame))
+            for symbol in symbols
+        ]
+        results = await asyncio.gather(*tasks)
+        
+        return {sym: data for sym, data in zip(symbols, results)}
+
+    def get_hist(
+            self,
+            symbol: List[str]|str,
+            exchange: str = "NSE",
+            interval: Interval = Interval.in_daily,
+            n_bars: int = 10,
+            dataFrame: bool = True,
+            fut_contract: int = None,
+            extended_session: bool = False
+        ) -> pd.DataFrame|Dict[str, List[List]|pd.DataFrame]|List[List]:
+        """Fetch historical data for a single or multiple symbols.
+
+        Args:
+            symbols (list[str] | str): Single symbol or list of symbols.
+            exchange (str, optional): Exchange. Defaults to "NSE".
+            interval (Interval, optional): Interval. Defaults to Interval.in_daily.
+            n_bars (int, optional): Number of bars. Defaults to 10.
+            dataFrame (bool, optional): Return as DataFrame. Defaults to True.
+            fut_contract (int, optional): Future contract. Defaults to None.
+            extended_session (bool, optional): Extended session. Defaults to False.
+
+        Returns:
+            pd.DataFrame | Dict[str, List[List] | pd.DataFrame] | List[List]: Historical data.
+        """
+        if isinstance(symbol, str):
+            return asyncio.run(self.__fetch_symbol_data(symbol, exchange=exchange, interval=interval, n_bars=n_bars, fut_contract=fut_contract, extended_session=extended_session, dataFrame=dataFrame))
+
+        return asyncio.run(self.get_hist_async(symbol, exchange=exchange, interval=interval, n_bars=n_bars, fut_contract=fut_contract, extended_session=extended_session, dataFrame=dataFrame))
 
     def search_symbol(self, text: str, exchange: str = ''):
         url = self.__search_url.format(text, exchange)
@@ -345,15 +405,9 @@ class TvDatafeed:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
-    tv = TvDatafeed()
-    print(tv.get_hist("CRUDEOIL", "MCX", fut_contract=1))
-    print(tv.get_hist("NIFTY", "NSE", fut_contract=1))
-    print(
-        tv.get_hist(
-            "EICHERMOT",
-            "NSE",
-            interval=Interval.in_1_hour,
-            n_bars=500,
-            extended_session=False,
-        )
-    )
+    
+    username = getenv('MAIL')
+    password = getenv('PASSWORD')
+    
+    tv = TvDatafeed(username, password, pro=True, )
+    print(tv.get_hist(["PFC", "UNIONBANK", "BDL"], "NSE", Interval.in_5_minute, n_bars=11000))
