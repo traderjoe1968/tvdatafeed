@@ -23,3 +23,5 @@ tvDatafeed/symbols.pkl
 tvDatafeed/beta.py
 
 token*
+.DS_Store
+*.log

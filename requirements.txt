@@ -1,4 +1,6 @@
-setuptools~=49.2.0
-pandas~=1.0.5
+setuptools
+pandas
 websocket-client
 requests
+dotenv
+pyotp
