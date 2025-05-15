@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 tokendata = "token.txt"
 
+
 class Interval(enum.Enum):
     in_1_minute = "1"
     in_3_minute = "3"
