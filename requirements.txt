@@ -2,5 +2,6 @@ setuptools
 pandas
 websocket-client
 requests
-dotenv
+pyotp
+python-dotenv
 pyotp
