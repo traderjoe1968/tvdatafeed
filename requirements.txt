@@ -4,4 +4,3 @@ websocket-client
 requests
 pyotp
 python-dotenv
-pyotp
