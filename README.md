@@ -1,5 +1,15 @@
 # **NOTE**
 
+> **This is an improved fork of TvDatafeed.**
+>
+> - Windows compatibility: Dates before 1970 now work correctly when fetching historical data.
+> - Nologin method: Can fetch more than 5000 bars for some symbols (typically daily timeframe, e.g., XAUUSD:OANDA).
+> - See below for more details and usage notes.
+
+---
+
+# **NOTE**
+
 This is a fork of the original [TvDatafeed](https://github.com/rongardF/tvdatafeed.git) project by StreamAlpha. This fork has live data retrieving feature implemented. 
 More information about this will be found in the TvDatafeedLive section down below in the README.
 
@@ -62,6 +72,10 @@ tv = TvDatafeed()
 ```
 
 when using without login, following warning will be shown `you are using nologin method, data you access may be limited`
+
+**Note:** The nologin method now works for more than 5000 bars for some symbols (e.g., `XAUUSD:OANDA`). Try your symbol to check availability.
+
+This extended limit is typically available for the daily timeframe. Other intervals may still be restricted.
 
 ---
 
