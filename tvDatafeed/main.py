@@ -133,14 +133,28 @@ class TvDatafeed:
     @staticmethod
     def __create_df(raw_data, symbol):
         try:
-            out = re.search('"s":\[(.+?)\}\]', raw_data).group(1)
+            out = re.search(r'"s":\[(.+?)\}\]', raw_data).group(1)
             x = out.split(',{"')
             data = list()
             volume_data = True
 
+            epoch = datetime.datetime(1970, 1, 1)
+
             for xi in x:
-                xi = re.split("\[|:|,|\]", xi)
-                ts = datetime.datetime.fromtimestamp(float(xi[4]))
+                xi = re.split(r"\[|:|,|\]", xi)
+
+                try:
+                    ts_raw = float(xi[4])
+                except ValueError:
+                    # malformed row, skip
+                    continue
+
+                try:
+                    # works for negative timestamps too (pre-1970)
+                    ts = epoch + datetime.timedelta(0, ts_raw)
+                except OverflowError:
+                    # insane timestamp, skip
+                    continue
 
                 row = [ts]
 
