@@ -5,13 +5,13 @@ import logging
 import random
 import re
 import string
+import time
 import pandas as pd
+from datetime import datetime as dt, timedelta
 from websocket import create_connection
 import requests
-import json
 
 logger = logging.getLogger(__name__)
-
 
 class Interval(enum.Enum):
     in_1_minute = "1"
@@ -28,6 +28,12 @@ class Interval(enum.Enum):
     in_weekly = "1W"
     in_monthly = "1M"
 
+# seconds per bar (used only for optional buffer)
+INTERVAL_SECONDS = {
+    "1": 60, "3": 180, "5": 300, "15": 900, "30": 1800, "45": 2700,
+    "1H": 3600, "2H": 7200, "3H": 10800, "4H": 14400,
+    "1D": 86400, "1W": 604800, "1M": 2592000,
+}
 
 class TvDatafeed:
     __sign_in_url = 'https://www.tradingview.com/accounts/signin/'
@@ -36,28 +42,12 @@ class TvDatafeed:
     __signin_headers = {'Referer': 'https://www.tradingview.com'}
     __ws_timeout = 5
 
-    def __init__(
-        self,
-        username: str = None,
-        password: str = None,
-    ) -> None:
-        """Create TvDatafeed object
-
-        Args:
-            username (str, optional): tradingview username. Defaults to None.
-            password (str, optional): tradingview password. Defaults to None.
-        """
-
+    def __init__(self, username: str = None, password: str = None) -> None:
         self.ws_debug = False
-
         self.token = self.__auth(username, password)
-
         if self.token is None:
             self.token = "unauthorized_user_token"
-            logger.warning(
-                "you are using nologin method, data you access may be limited"
-            )
-
+            logger.warning("you are using nologin method, data you access may be limited")
         self.ws = None
         self.session = self.__generate_session()
         self.chart_session = self.__generate_chart_session()
@@ -191,130 +181,148 @@ class TvDatafeed:
         exchange: str = "NSE",
         interval: Interval = Interval.in_daily,
         n_bars: int = 10,
-        fut_contract: int = None,
+        start_date: dt | str | None = None,
+        end_date: dt | str | None = None,
+        fut_contract: int | None = None,
         extended_session: bool = False,
+        chunk_days: int = 180,      # ← change this for larger/smaller chunks (90–400 safe)
+        sleep_seconds: int = 3,     # ← sleep between chunks to stay under rate limits
     ) -> pd.DataFrame:
-        """get historical data
-
-        Args:
-            symbol (str): symbol name
-            exchange (str, optional): exchange, not required if symbol is in format EXCHANGE:SYMBOL. Defaults to None.
-            interval (str, optional): chart interval. Defaults to 'D'.
-            n_bars (int, optional): no of bars to download, max 5000. Defaults to 10.
-            fut_contract (int, optional): None for cash, 1 for continuous current contract in front, 2 for continuous next contract in front . Defaults to None.
-            extended_session (bool, optional): regular session if False, extended session if True, Defaults to False.
-
-        Returns:
-            pd.Dataframe: dataframe with sohlcv as columns
         """
-        symbol = self.__format_symbol(
-            symbol=symbol, exchange=exchange, contract=fut_contract
-        )
+        If start_date/end_date are given → date-range mode with automatic chunking.
+        Otherwise falls back to original n_bars behaviour.
+        """
+        if start_date is None and end_date is None:
+            # ==================== ORIGINAL n_bars MODE (unchanged) ====================
+            symbol = self.__format_symbol(symbol=symbol, exchange=exchange, contract=fut_contract)
+            interval_val = interval.value
 
-        interval = interval.value
+            self.__create_connection()
+            self.__send_message("set_auth_token", [self.token])
+            self.__send_message("chart_create_session", [self.chart_session, ""])
+            self.__send_message("quote_create_session", [self.session])
+            self.__send_message("quote_set_fields", [self.session, "ch", "chp", "current_session", "description",
+                                                     "local_description", "language", "exchange", "fractional",
+                                                     "is_tradable", "lp", "lp_time", "minmov", "minmove2",
+                                                     "original_name", "pricescale", "pro_name", "short_name",
+                                                     "type", "update_mode", "volume", "currency_code", "rchp", "rtc"])
+            self.__send_message("quote_add_symbols", [self.session, symbol, {"flags": ["force_permission"]}])
+            self.__send_message("quote_fast_symbols", [self.session, symbol])
+            self.__send_message("resolve_symbol", [self.chart_session, "symbol_1",
+                                                   f'={{"symbol":"{symbol}","adjustment":"splits","session":"{"regular" if not extended_session else "extended"}"}}'])
+            self.__send_message("create_series", [self.chart_session, "s1", "s1", "symbol_1", interval_val, n_bars])
+            self.__send_message("switch_timezone", [self.chart_session, "exchange"])
 
+            raw_data = ""
+            logger.debug(f"getting {n_bars} bars for {symbol}...")
+            while True:
+                try:
+                    result = self.ws.recv()
+                    raw_data += result + "\n"
+                    if "series_completed" in result:
+                        break
+                except Exception as e:
+                    logger.error(e)
+                    break
+            self.ws.close()
+            return self.__create_df(raw_data, symbol)
+
+        # ==================== NEW DATE-RANGE MODE WITH CHUNKING ====================
+        # normalise dates
+        if isinstance(start_date, str):
+            start_date = dt.fromisoformat(start_date.replace("Z", "+00:00"))
+        if isinstance(end_date, str):
+            end_date = dt.fromisoformat(end_date.replace("Z", "+00:00"))
+        if start_date is None:
+            start_date = dt(2000, 1, 1)
+        if end_date is None or end_date > dt.now():
+            end_date = dt.now()
+        if start_date >= end_date:
+            raise ValueError("start_date must be before end_date")
+
+        symbol_formatted = self.__format_symbol(symbol, exchange, fut_contract)
+        interval_val = interval.value
+
+        df_list = []
+        current_start = start_date
+
+        while current_start < end_date:
+            current_end = min(current_start + timedelta(days=chunk_days), end_date)
+
+            start_ts = int(current_start.timestamp() * 1000)   # milliseconds
+            end_ts   = int(current_end.timestamp() * 1000)
+
+            # optional 30-min buffer for intraday (as used in the original PR)
+            if INTERVAL_SECONDS.get(interval_val, 60) < 86400:
+                start_ts -= 1_800_000
+                end_ts   -= 1_800_000
+
+            range_str = f"r,{start_ts}:{end_ts}"
+
+            df_chunk = self._fetch_range(symbol_formatted, interval_val, range_str, extended_session)
+            if not df_chunk.empty:
+                df_list.append(df_chunk)
+
+            current_start = current_end
+            time.sleep(sleep_seconds)   # rate-limit safety
+
+        if df_list:
+            df = pd.concat(df_list)
+            df = df[~df.index.duplicated(keep='first')].sort_index()
+            df = df[(df.index >= start_date) & (df.index <= end_date)]
+            return df
+        return pd.DataFrame()
+
+    def _fetch_range(self, symbol: str, interval: str, range_str: str, extended_session: bool = False) -> pd.DataFrame:
+        """Internal helper that fetches one chunk using the range request."""
         self.__create_connection()
-
         self.__send_message("set_auth_token", [self.token])
         self.__send_message("chart_create_session", [self.chart_session, ""])
         self.__send_message("quote_create_session", [self.session])
-        self.__send_message(
-            "quote_set_fields",
-            [
-                self.session,
-                "ch",
-                "chp",
-                "current_session",
-                "description",
-                "local_description",
-                "language",
-                "exchange",
-                "fractional",
-                "is_tradable",
-                "lp",
-                "lp_time",
-                "minmov",
-                "minmove2",
-                "original_name",
-                "pricescale",
-                "pro_name",
-                "short_name",
-                "type",
-                "update_mode",
-                "volume",
-                "currency_code",
-                "rchp",
-                "rtc",
-            ],
-        )
-
-        self.__send_message(
-            "quote_add_symbols", [self.session, symbol,
-                                  {"flags": ["force_permission"]}]
-        )
+        self.__send_message("quote_set_fields", [self.session, "ch", "chp", "current_session", "description",
+                                                 "local_description", "language", "exchange", "fractional",
+                                                 "is_tradable", "lp", "lp_time", "minmov", "minmove2",
+                                                 "original_name", "pricescale", "pro_name", "short_name",
+                                                 "type", "update_mode", "volume", "currency_code", "rchp", "rtc"])
+        self.__send_message("quote_add_symbols", [self.session, symbol, {"flags": ["force_permission"]}])
         self.__send_message("quote_fast_symbols", [self.session, symbol])
+        self.__send_message("resolve_symbol", [self.chart_session, "symbol_1",
+                                               f'={{"symbol":"{symbol}","adjustment":"splits","session":"{"regular" if not extended_session else "extended"}"}}'])
 
-        self.__send_message(
-            "resolve_symbol",
-            [
-                self.chart_session,
-                "symbol_1",
-                '={"symbol":"'
-                + symbol
-                + '","adjustment":"splits","session":'
-                + ('"regular"' if not extended_session else '"extended"')
-                + "}",
-            ],
-        )
-        self.__send_message(
-            "create_series",
-            [self.chart_session, "s1", "s1", "symbol_1", interval, n_bars],
-        )
-        self.__send_message("switch_timezone", [
-                            self.chart_session, "exchange"])
+        self.__send_message("create_series", [self.chart_session, "s1", "s1", "symbol_1", interval, 100])  # dummy
+        self.__send_message("switch_timezone", [self.chart_session, "exchange"])
+
+        time.sleep(0.5)
+        self.__send_message("modify_series", [self.chart_session, "s1", "s1", "symbol_1", interval, range_str])
 
         raw_data = ""
-
-        logger.debug(f"getting data for {symbol}...")
+        logger.debug(f"fetching range {range_str} for {symbol}...")
         while True:
             try:
                 result = self.ws.recv()
-                raw_data = raw_data + result + "\n"
+                raw_data += result + "\n"
+                if "series_completed" in result:
+                    break
             except Exception as e:
                 logger.error(e)
                 break
-
-            if "series_completed" in result:
-                break
-
+        self.ws.close()
         return self.__create_df(raw_data, symbol)
 
-    def search_symbol(self, text: str, exchange: str = ''):
-        url = self.__search_url.format(text, exchange)
 
-        symbols_list = []
-        try:
-            resp = requests.get(url)
-
-            symbols_list = json.loads(resp.text.replace(
-                '</em>', '').replace('<em>', ''))
-        except Exception as e:
-            logger.error(e)
-
-        return symbols_list
-
-
+# Example usage for your 10-year 5-min request
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-    tv = TvDatafeed()
-    print(tv.get_hist("CRUDEOIL", "MCX", fut_contract=1))
-    print(tv.get_hist("NIFTY", "NSE", fut_contract=1))
-    print(
-        tv.get_hist(
-            "EICHERMOT",
-            "NSE",
-            interval=Interval.in_1_hour,
-            n_bars=500,
-            extended_session=False,
-        )
+    tv = TvDatafeed()   # or TvDatafeed(username, password) for more bars
+
+    df = tv.get_hist(
+        symbol="BTCUSD",
+        exchange="COINBASE",
+        interval=Interval.in_5_minute,
+        start_date=dt(2016, 1, 1),
+        end_date=dt.now(),
+        chunk_days=180,      # safe default
+        sleep_seconds=3
     )
+
+    print(df)
+    df.to_csv("10y_5min_BTCUSD.csv")
