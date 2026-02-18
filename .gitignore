@@ -20,3 +20,5 @@ env.bak/
 venv.bak/
 tvDatafeed/symbols.pkl
 tvDatafeed/beta.py
+uv.lock
+.python-version

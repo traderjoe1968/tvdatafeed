@@ -6,12 +6,16 @@ import random
 import re
 import string
 import time
+from pathlib import Path
 import pandas as pd
 from datetime import datetime as dt, timedelta
 from websocket import create_connection
 import requests
 
 logger = logging.getLogger(__name__)
+
+token_path = Path.home() / ".tvdatafeed" / "token"
+token_path.parent.mkdir(parents=True, exist_ok=True)
 
 class Interval(enum.Enum):
     in_1_minute = "1"
@@ -35,16 +39,25 @@ INTERVAL_SECONDS = {
     "1D": 86400, "1W": 604800, "1M": 2592000,
 }
 
+_FRAME_SPLITTER = re.compile(r'~m~\d+~m~')
+
 class TvDatafeed:
     __sign_in_url = 'https://www.tradingview.com/accounts/signin/'
+    __sign_in_totp = 'https://www.tradingview.com/accounts/two-factor/signin/totp/'
+    __sign_in_sms = 'https://www.tradingview.com/accounts/two-factor/signin/sms/'
+    __sign_in_email = 'https://www.tradingview.com/accounts/two-factor/signin/email/'
     __search_url = 'https://symbol-search.tradingview.com/symbol_search/?text={}&hl=1&exchange={}&lang=en&type=&domain=production'
     __ws_headers = json.dumps({"Origin": "https://data.tradingview.com"})
     __signin_headers = {'Referer': 'https://www.tradingview.com'}
     __ws_timeout = 5
 
-    def __init__(self, username: str = None, password: str = None) -> None:
+    def __init__(self, username: str | None = None, password: str | None = None, token: str | None = None) -> None:
         self.ws_debug = False
-        self.token = self.__auth(username, password)
+        if token:
+            self.token = token
+            self.__save_token(token)
+        else:
+            self.token = self.__auth(username, password)
         if self.token is None:
             self.token = "unauthorized_user_token"
             logger.warning("you are using nologin method, data you access may be limited")
@@ -53,23 +66,175 @@ class TvDatafeed:
         self.chart_session = self.__generate_chart_session()
 
     def __auth(self, username, password):
+        # try cached token first
+        try:
+            token = token_path.read_text().strip()
+            if token:
+                logger.info("loaded cached auth token from %s", token_path)
+                return token
+        except (IOError, OSError):
+            pass
 
-        if (username is None or password is None):
-            token = None
+        if username is None or password is None:
+            return None
 
-        else:
-            data = {"username": username,
-                    "password": password,
-                    "remember": "on"}
+        data = {"username": username,
+                "password": password,
+                "remember": "on"}
+        max_retries = 10
+        delay = 30  # seconds; TV rate limit typically resets in 5-10 min, doubles each retry
+
+        for attempt in range(1, max_retries + 1):
             try:
-                response = requests.post(
-                    url=self.__sign_in_url, data=data, headers=self.__signin_headers)
-                token = response.json()['user']['auth_token']
-            except Exception as e:
-                logger.error('error while signin')
-                token = None
+                with requests.Session() as s:
+                    response = s.post(
+                        url=self.__sign_in_url, data=data, headers=self.__signin_headers)
+                    resp_json = response.json()
+                    error_code = resp_json.get("code", "")
 
-        return token
+                    if error_code == "rate_limit":
+                        if attempt < max_retries:
+                            total_waited = sum(30 * 2**i for i in range(attempt))
+                            logger.warning(
+                                "Rate limited by TradingView — waiting %ds before retry "
+                                "(attempt %d/%d, ~%ds total waited so far)",
+                                delay, attempt, max_retries, total_waited)
+                            time.sleep(delay)
+                            delay *= 2
+                            continue
+                        logger.error(
+                            "Still rate limited after %d attempts. Use token= parameter to bypass login:\n"
+                            "  TvDatafeed(token='your_sessionid') or set TV_TOKEN in .env",
+                            max_retries)
+                        return None
+
+                    if error_code == "recaptcha_required":
+                        logger.error(
+                            "CAPTCHA required — programmatic login blocked by TradingView.\n"
+                            "  Use token= parameter instead:\n"
+                            "  1. Log in at tradingview.com in your browser\n"
+                            "  2. DevTools (F12) → Application → Cookies → copy 'sessionid'\n"
+                            "  3. Pass it as: TvDatafeed(token='your_sessionid')\n"
+                            "     or set TV_TOKEN in your .env file")
+                        return None
+
+                    if error_code == "2FA_required":
+                        two_factor_types = [t["name"] for t in resp_json.get("two_factor_types", [])]
+                        logger.info("2FA required, types: %s", two_factor_types)
+                        code = self.__prompt_2fa()
+                        if code is None:
+                            raise ValueError("2FA code not provided")
+                        if "totp" in two_factor_types:
+                            response = s.post(
+                                url=self.__sign_in_totp, data={"code": int(code)},
+                                headers=self.__signin_headers)
+                        elif "sms" in two_factor_types:
+                            response = s.post(
+                                url=self.__sign_in_sms, data={"code": int(code)},
+                                headers=self.__signin_headers)
+                        elif "email" in two_factor_types:
+                            response = s.post(
+                                url=self.__sign_in_email, data={"code": int(code)},
+                                headers=self.__signin_headers)
+                        else:
+                            raise ValueError(f"unsupported 2FA type: {two_factor_types}")
+                        resp_json = response.json()
+
+                    if "error" in resp_json:
+                        raise ValueError(
+                            f"signin error [{resp_json.get('code', '')}]: {resp_json.get('error', '')}")
+
+                    token = resp_json['user']['auth_token']
+                    self.__save_token(token)
+                    return token
+
+            except (ValueError, KeyError) as e:
+                logger.error("error while signin: %s", e)
+                return None
+            except Exception as e:
+                logger.error("error while signin: %s", e)
+                return None
+
+        return None
+
+    @staticmethod
+    def __prompt_2fa():
+        """Open a local web page in the browser to collect the 2FA code."""
+        import http.server
+        import threading
+        import webbrowser
+
+        code = None
+
+        _HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>TradingView 2FA</title>
+<style>
+  body{font-family:system-ui,sans-serif;display:flex;justify-content:center;
+       align-items:center;height:100vh;margin:0;background:#1e222d}
+  .card{background:#2a2e39;padding:40px;border-radius:12px;text-align:center;
+        box-shadow:0 8px 32px rgba(0,0,0,.4)}
+  h2{color:#d1d4dc;margin:0 0 20px}
+  input{font-size:24px;width:180px;padding:10px;text-align:center;
+        border:2px solid #434651;border-radius:8px;background:#131722;
+        color:#d1d4dc;outline:none}
+  input:focus{border-color:#2962ff}
+  button{margin-top:16px;padding:10px 32px;font-size:16px;border:none;
+         border-radius:8px;background:#2962ff;color:#fff;cursor:pointer}
+  button:hover{background:#1e53e5}
+  .done{color:#26a69a;font-size:18px;margin-top:12px;display:none}
+</style></head><body><div class="card">
+  <h2>TradingView 2FA Code</h2>
+  <form id="f"><input id="c" type="text" maxlength="8" autofocus
+    placeholder="000000"><br><button type="submit">Submit</button></form>
+  <div class="done" id="d">Code received — you can close this tab.</div>
+</div><script>
+document.getElementById('f').onsubmit=function(e){
+  e.preventDefault();
+  var c=document.getElementById('c').value.trim();
+  if(!c)return;
+  fetch('/code?v='+c).then(function(){
+    document.getElementById('f').style.display='none';
+    document.getElementById('d').style.display='block';
+  });
+};
+</script></body></html>"""
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                nonlocal code
+                if self.path.startswith('/code?v='):
+                    code = self.path.split('=', 1)[1]
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b'ok')
+                    threading.Thread(target=self.server.shutdown, daemon=True).start()
+                else:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(_HTML.encode())
+            def log_message(self, *args):
+                pass  # silence request logs
+
+        srv = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        port = srv.server_address[1]
+        url = f'http://127.0.0.1:{port}'
+
+        logger.info("2FA required — opening browser at %s", url)
+        webbrowser.open(url)
+        srv.serve_forever()
+        srv.server_close()
+        return code if code else None
+
+    @staticmethod
+    def __save_token(token):
+        token_path.write_text(token)
+        logger.info("saved auth token to %s", token_path)
+
+    @staticmethod
+    def __delete_token():
+        token_path.unlink(missing_ok=True)
+        logger.info("deleted cached auth token")
 
     def __create_connection(self):
         logging.debug("creating websocket connection")
@@ -78,14 +243,17 @@ class TvDatafeed:
         )
 
     @staticmethod
-    def __filter_raw_message(text):
-        try:
-            found = re.search('"m":"(.+?)",', text).group(1)
-            found2 = re.search('"p":(.+?"}"])}', text).group(1)
-
-            return found, found2
-        except AttributeError:
-            logger.error("error in filter_raw_message")
+    def __parse_ws_packets(raw_data):
+        """Split raw ~m~ framed websocket data into parsed JSON packets."""
+        packets = []
+        for part in _FRAME_SPLITTER.split(raw_data):
+            if not part or part.startswith('~h~'):
+                continue
+            try:
+                packets.append(json.loads(part))
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return packets
 
     @staticmethod
     def __generate_session():
@@ -121,43 +289,42 @@ class TvDatafeed:
         self.ws.send(m)
 
     @staticmethod
-    def __create_df(raw_data, symbol):
-        try:
-            out = re.search('"s":\[(.+?)\}\]', raw_data).group(1)
-            x = out.split(',{"')
-            data = list()
-            volume_data = True
+    def __create_df(packets, symbol):
+        """Build a DataFrame from parsed websocket JSON packets."""
+        data = []
+        has_oi = False
+        for packet in packets:
+            if not isinstance(packet, dict) or packet.get("m") not in ("timescale_update", "du"):
+                continue
+            try:
+                series = packet["p"][1].get("s1", packet["p"][1].get("sds_1", {}))
+                bars = series.get("s", [])
+            except (IndexError, KeyError, AttributeError):
+                continue
+            for bar in bars:
+                try:
+                    v = bar["v"]
+                    ts = datetime.datetime.fromtimestamp(v[0])
+                    open_, high, low, close = v[1], v[2], v[3], v[4]
+                    vol = v[5] if len(v) > 5 else 0.0
+                    oi = v[6] if len(v) > 6 else None
+                    if oi is not None:
+                        has_oi = True
+                    data.append([ts, open_, high, low, close, vol, oi])
+                except (KeyError, IndexError, TypeError, ValueError) as e:
+                    logger.debug("skipping malformed bar: %s", e)
+                    continue
 
-            for xi in x:
-                xi = re.split("\[|:|,|\]", xi)
-                ts = datetime.datetime.fromtimestamp(float(xi[4]))
-
-                row = [ts]
-
-                for i in range(5, 10):
-
-                    # skip converting volume data if does not exists
-                    if not volume_data and i == 9:
-                        row.append(0.0)
-                        continue
-                    try:
-                        row.append(float(xi[i]))
-
-                    except ValueError:
-                        volume_data = False
-                        row.append(0.0)
-                        logger.debug('no volume data')
-
-                data.append(row)
-
-            data = pd.DataFrame(
-                data, columns=["datetime", "open",
-                               "high", "low", "close", "volume"]
-            ).set_index("datetime")
-            data.insert(0, "symbol", value=symbol)
-            return data
-        except AttributeError:
+        if not data:
             logger.error("no data, please check the exchange and symbol")
+            return pd.DataFrame()
+
+        columns = ["datetime", "open", "high", "low", "close", "volume", "OI"]
+        df = pd.DataFrame(data, columns=columns).set_index("datetime")
+        if not has_oi:
+            df = df.drop(columns=["OI"])
+        df.insert(0, "symbol", value=symbol)
+        return df
 
     @staticmethod
     def __format_symbol(symbol, exchange, contract: int = None):
@@ -225,7 +392,8 @@ class TvDatafeed:
                     logger.error(e)
                     break
             self.ws.close()
-            return self.__create_df(raw_data, symbol)
+            packets = self.__parse_ws_packets(raw_data)
+            return self.__create_df(packets, symbol)
 
         # ==================== NEW DATE-RANGE MODE WITH CHUNKING ====================
         # normalise dates
@@ -307,17 +475,40 @@ class TvDatafeed:
                 logger.error(e)
                 break
         self.ws.close()
-        return self.__create_df(raw_data, symbol)
+        packets = self.__parse_ws_packets(raw_data)
+        return self.__create_df(packets, symbol)
 
 
 # Example usage for your 10-year 5-min request
 if __name__ == "__main__":
-    tv = TvDatafeed()   # or TvDatafeed(username, password) for more bars
+    import argparse
+    import os
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
+
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--username", default=None)
+    parser.add_argument("--password", default=None)
+    parser.add_argument("--token", default=None, help="TradingView sessionid cookie from browser DevTools")
+    args = parser.parse_args()
+
+    username = args.username or os.environ.get("TV_USERNAME")
+    password = args.password or os.environ.get("TV_PASSWORD")
+    token = args.token or os.environ.get("TV_TOKEN")
+
+    tv = TvDatafeed(username, password, token=token)
+    Sym="ES1!"
+    Exch="CME"
     df = tv.get_hist(
-        symbol="BTCUSD",
-        exchange="COINBASE",
-        interval=Interval.in_5_minute,
+        symbol=Sym,
+        exchange=Exch,
+        interval=Interval.in_15_minute,
         start_date=dt(2016, 1, 1),
         end_date=dt.now(),
         chunk_days=180,      # safe default
@@ -325,4 +516,4 @@ if __name__ == "__main__":
     )
 
     print(df)
-    df.to_csv("10y_5min_BTCUSD.csv")
+    df.to_csv(f"{Sym}_{Exch}.csv")
