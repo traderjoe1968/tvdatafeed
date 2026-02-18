@@ -482,7 +482,7 @@ document.getElementById('f').onsubmit=function(e){
         return self.__create_df(packets, symbol)
 
 
-# Example usage for your 10-year 5-min request
+# Example usage for your request
 if __name__ == "__main__":
     import argparse
     import os
