@@ -7,9 +7,9 @@ import re
 import string
 import time
 from pathlib import Path
-import pandas as pd
+import pandas as pd  # noqa
 from datetime import datetime as dt, timedelta
-from websocket import create_connection
+from websocket import WebSocket, create_connection
 import requests
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ class TvDatafeed:
         if self.token is None:
             self.token = "unauthorized_user_token"
             logger.warning("you are using nologin method, data you access may be limited")
-        self.ws = None
+        self.ws: WebSocket | None = None
         self.session = self.__generate_session()
         self.chart_session = self.__generate_chart_session()
 
@@ -213,7 +213,7 @@ document.getElementById('f').onsubmit=function(e){
                     self.send_header('Content-Type', 'text/html')
                     self.end_headers()
                     self.wfile.write(_HTML.encode())
-            def log_message(self, *args):
+            def log_message(self, format: str, *args: object) -> None:
                 pass  # silence request logs
 
         srv = http.server.HTTPServer(('127.0.0.1', 0), Handler)
@@ -286,6 +286,7 @@ document.getElementById('f').onsubmit=function(e){
         m = self.__create_message(func, args)
         if self.ws_debug:
             print(m)
+        assert self.ws is not None
         self.ws.send(m)
 
     @staticmethod
@@ -327,7 +328,7 @@ document.getElementById('f').onsubmit=function(e){
         return df
 
     @staticmethod
-    def __format_symbol(symbol, exchange, contract: int = None):
+    def __format_symbol(symbol, exchange, contract: int | None = None):
 
         if ":" in symbol:
             pass
@@ -350,7 +351,7 @@ document.getElementById('f').onsubmit=function(e){
         n_bars: int = 10,
         start_date: dt | str | None = None,
         end_date: dt | str | None = None,
-        fut_contract: int | None = None,
+        fut_contract: int | None = None,  # Continuous futures: 1=front, 2=next, e.g. get_hist("ES","CME",fut_contract=1) → CME:ES1!  For specific expiry use symbol directly: get_hist("ESH2025","CME")
         extended_session: bool = False,
         chunk_days: int = 180,      # ← change this for larger/smaller chunks (90–400 safe)
         sleep_seconds: int = 3,     # ← sleep between chunks to stay under rate limits
@@ -382,11 +383,12 @@ document.getElementById('f').onsubmit=function(e){
 
             raw_data = ""
             logger.debug(f"getting {n_bars} bars for {symbol}...")
+            assert self.ws is not None
             while True:
                 try:
                     result = self.ws.recv()
-                    raw_data += result + "\n"
-                    if "series_completed" in result:
+                    raw_data += result + "\n"  # ty:ignore[unsupported-operator]
+                    if "series_completed" in result:  # ty:ignore[unsupported-operator]
                         break
                 except Exception as e:
                     logger.error(e)
@@ -465,11 +467,12 @@ document.getElementById('f').onsubmit=function(e){
 
         raw_data = ""
         logger.debug(f"fetching range {range_str} for {symbol}...")
+        assert self.ws is not None
         while True:
             try:
                 result = self.ws.recv()
-                raw_data += result + "\n"
-                if "series_completed" in result:
+                raw_data += result + "\n"  # ty:ignore[unsupported-operator]
+                if "series_completed" in result:  # ty:ignore[unsupported-operator]
                     break
             except Exception as e:
                 logger.error(e)
@@ -508,8 +511,8 @@ if __name__ == "__main__":
     df = tv.get_hist(
         symbol=Sym,
         exchange=Exch,
-        interval=Interval.in_15_minute,
-        start_date=dt(2016, 1, 1),
+        interval=Interval.in_daily,
+        start_date=dt(2025, 1, 1),
         end_date=dt.now(),
         chunk_days=180,      # safe default
         sleep_seconds=3

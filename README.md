@@ -257,6 +257,46 @@ Following timeframes intervals are supported-
 
 ---
 
+## Recent Changes (by Claude, Anthropic's AI Assistant)
+
+The following improvements were made to address TradingView API changes and improve reliability:
+
+### Authentication Overhaul
+
+- **Direct token authentication**: Pass your TradingView `sessionid` cookie directly via `token=` parameter, `--token` CLI arg, or `TV_TOKEN` environment variable — bypasses Cloudflare captcha and rate limiting entirely
+
+  ```python
+  # Browser → tradingview.com → DevTools → Application → Cookies → copy sessionid value
+  tv = TvDatafeed(token="your_sessionid_here")
+  ```
+
+- **Token caching**: Auth token is saved to `~/.tvdatafeed/token` after first successful login and reused on subsequent runs
+- **2FA support**: Handles TOTP, SMS, and email-based two-factor authentication with a browser-based popup dialog for code entry (no native GUI dependencies)
+- **Rate limit retry**: Exponential backoff (starting at 30s, doubling each attempt, up to 10 retries) when TradingView rate-limits login requests, with logger output showing delay and attempt progress
+- **All auth challenge types handled**: `rate_limit`, `recaptcha_required`, and `2FA_required` responses are detected and handled appropriately
+
+### WebSocket Parser Rewrite
+
+- **JSON-based parsing**: Replaced fragile regex string splitting with proper `~m~` frame splitting and `json.loads` parsing — eliminates `ValueError` crashes on malformed data
+- **Robust bar extraction**: OHLCV data is extracted from parsed JSON packet structure instead of positional string indexing
+
+### Open Interest Support
+
+- **OI column**: Open Interest data is automatically included in the DataFrame (as `OI` column) when returned by TradingView (e.g., futures contracts). Omitted for instruments that don't report it.
+
+  ```python
+  # Futures will include OI column
+  es_data = tv.get_hist(symbol='ES1!', exchange='CME', interval=Interval.in_daily, n_bars=100)
+  ```
+
+### Bug Fixes
+
+- Fixed `SyntaxWarning` from invalid regex escape sequences
+- Fixed `autht_oken` typo causing signin failures
+- Added `logging.basicConfig` to `__main__` block for visible logger output
+
+---
+
 ## Read this before creating an issue
 
 Before creating an issue in this library, please follow the following steps.
