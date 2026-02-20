@@ -1142,7 +1142,7 @@ if __name__ == "__main__":
         symbol=Sym,
         exchange=Exch,
         interval=Interval.in_daily,
-        start_date=dt(2000, 1, 1),
+        start_date=dt(2010, 1, 1),
         end_date=dt.now(),
         fut_contract=1,
         extended_session=True,
