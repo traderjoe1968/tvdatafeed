@@ -1,6 +1,0 @@
-setuptools~=49.2.0
-pandas~=1.0.5
-websocket-client~=0.57.0
-pyotp>=2.9.0
-python-dotenv>=1.1.1
-requests

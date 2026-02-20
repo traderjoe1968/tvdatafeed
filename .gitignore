@@ -22,3 +22,5 @@ tvDatafeed/symbols.pkl
 tvDatafeed/beta.py
 uv.lock
 .python-version
+data/
+ES_CME_MINI.csv

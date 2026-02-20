@@ -230,71 +230,85 @@ data=seis.get_hist(n_bars=10, timeout=-1)
 Following timeframes intervals are supported-
 
 `Interval.in_1_minute`
-
 `Interval.in_3_minute`
-
 `Interval.in_5_minute`
-
 `Interval.in_15_minute`
-
 `Interval.in_30_minute`
-
 `Interval.in_45_minute`
-
 `Interval.in_1_hour`
-
 `Interval.in_2_hour`
-
 `Interval.in_3_hour`
-
 `Interval.in_4_hour`
-
 `Interval.in_daily`
-
 `Interval.in_weekly`
-
 `Interval.in_monthly`
-
 ---
 
 ## Recent Changes (by Claude, Anthropic's AI Assistant)
 
 The following improvements were made to address TradingView API changes and improve reliability:
 
-### Authentication Overhaul
+### Automatic Token Recovery
 
-- **Direct token authentication**: Pass your TradingView `sessionid` cookie directly via `token=` parameter, `--token` CLI arg, or `TV_TOKEN` environment variable — bypasses Cloudflare captcha and rate limiting entirely
+When the auth token expires or fails, the library now recovers automatically without any manual steps:
 
-  ```python
-  # Browser → tradingview.com → DevTools → Application → Cookies → copy sessionid value
-  tv = TvDatafeed(token="your_sessionid_here")
-  ```
+1. **Desktop app auto-extract** — If the TradingView desktop app is installed and signed in, cookies are read directly from its local SQLite database (with user permission via `[y/N]` prompt)
+2. **Browser login flow** — If the desktop app isn't available, a local web page opens with a "Log in to TradingView" button. After you sign in on tradingview.com, the library auto-detects your session by polling all browser cookie stores and connects automatically
 
-- **Token caching**: Auth token is saved to `~/.tvdatafeed/token` after first successful login and reused on subsequent runs
-- **2FA support**: Handles TOTP, SMS, and email-based two-factor authentication with a browser-based popup dialog for code entry (no native GUI dependencies)
-- **Rate limit retry**: Exponential backoff (starting at 30s, doubling each attempt, up to 10 retries) when TradingView rate-limits login requests, with logger output showing delay and attempt progress
-- **All auth challenge types handled**: `rate_limit`, `recaptcha_required`, and `2FA_required` responses are detected and handled appropriately
+No manual cookie copying or DevTools required.
+
+### Cross-Browser Cookie Reading
+
+Session cookies are automatically discovered from all major browsers:
+
+- **TradingView desktop app** (Electron, plaintext SQLite)
+- **Firefox** (plaintext SQLite, handles locked DB by copying to temp file)
+- **Safari** (macOS binary cookie format parser)
+- **Chromium-based browsers**: Chrome, Edge, Brave, Arc, Chromium (encrypted cookies with platform-specific decryption — macOS Keychain/PBKDF2/AES, Windows DPAPI, Linux PBKDF2)
+
+Supports macOS, Windows, and Linux.
+
+### Subscription Level Detection
+
+During token recovery, the library detects your TradingView plan (`pro`, `pro_premium`, or free) and reports it. Access via `tv.pro_plan` after initialization.
+
+### Date-Range Mode with Automatic Chunking
+
+```python
+df = tv.get_hist(
+    symbol='ES', exchange='CME_MINI', interval=Interval.in_daily,
+    start_date='2025-01-01', end_date='2025-12-31',
+    fut_contract=1, chunk_days=180, sleep_seconds=3,
+)
+```
+
+Fetches historical data across a date range by splitting into chunks to stay within TradingView limits. Handles deduplication and sorting automatically.
+
+### Authentication
+
+- **Token caching**: Auth token is saved to `~/.tvdatafeed/token` and reused on subsequent runs
+- **2FA support**: TOTP, SMS, and email-based two-factor authentication with a browser-based popup dialog for code entry
+- **Rate limit retry**: Exponential backoff when TradingView rate-limits login requests
 
 ### WebSocket Parser Rewrite
 
-- **JSON-based parsing**: Replaced fragile regex string splitting with proper `~m~` frame splitting and `json.loads` parsing — eliminates `ValueError` crashes on malformed data
-- **Robust bar extraction**: OHLCV data is extracted from parsed JSON packet structure instead of positional string indexing
+- **JSON-based parsing**: Proper `~m~` frame splitting and `json.loads` parsing instead of fragile regex string splitting
+- **Symbol error detection**: Invalid symbols (e.g. wrong exchange) now produce a clear error instead of silently timing out
 
 ### Open Interest Support
 
-- **OI column**: Open Interest data is automatically included in the DataFrame (as `OI` column) when returned by TradingView (e.g., futures contracts). Omitted for instruments that don't report it.
-
-  ```python
-  # Futures will include OI column
-  es_data = tv.get_hist(symbol='ES1!', exchange='CME', interval=Interval.in_daily, n_bars=100)
-  ```
+Open Interest data is automatically included in the DataFrame (as `OI` column) when returned by TradingView (e.g., futures contracts). Omitted for instruments that don't report it.
 
 ### Bug Fixes
 
+- Fixed symbol formatting: `CME_MINI:ES1!` is the correct exchange for E-mini S&P 500 futures (not `CME`)
 - Fixed `SyntaxWarning` from invalid regex escape sequences
 - Fixed `autht_oken` typo causing signin failures
-- Added `logging.basicConfig` to `__main__` block for visible logger output
 
+### PyTest Auth Checks
+```bash
+python -m pytest tests/ -v --timeout=900
+```
 ---
 
 ## Read this before creating an issue

@@ -1,14 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "tvdatafeed"
-version = "0.1.0"
-description = "Add your description here"
+version = "2.1.0"
+description = "TradingView historical data downloader"
 readme = "README.md"
-requires-python = ">=3.13"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "@StreamAlpha" },
+]
 dependencies = [
-    "setuptools>=49.2.0",
     "pandas>=1.0.5",
     "websocket-client>=0.57.0",
     "pyotp>=2.9.0",
     "python-dotenv>=1.1.1",
-    "requests"
+    "requests",
 ]
+
+[project.urls]
+Source = "https://github.com/StreamAlpha/tvdatafeed/"
+Tracker = "https://github.com/StreamAlpha/tvdatafeed/issues"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-timeout>=2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 300
+log_cli = true
+log_cli_level = "INFO"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tvDatafeed"]
