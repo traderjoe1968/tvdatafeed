@@ -25,6 +25,18 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# macOS Keychain key cache — maps service name to derived AES key bytes.
+# Populated on the first successful `security find-generic-password` call so
+# that subsequent browser fixtures never trigger the authorization dialog again.
+_chromium_key_cache: dict[str, bytes] = {}
+
+
+def _log_print(fmt: str, *args) -> None:
+    """Log at INFO level and echo to stdout so progress is always visible."""
+    msg = fmt % args if args else fmt
+    logger.info(msg)
+    print(msg)
+
 token_path = Path.home() / ".tvdatafeed" / "token"
 token_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -67,6 +79,84 @@ _INTERVAL_MAX_DAYS = {
 }
 
 _FRAME_SPLITTER = re.compile(r'~m~\d+~m~')
+
+
+# ── TOML helpers (no external deps) ─────────────────────────────────────────
+
+def _toml_value(v) -> str:
+    """Format a Python value as a TOML value literal (recursive for lists)."""
+    if v is None:
+        return '""'
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return repr(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_toml_value(i) for i in v) + "]"
+    s = str(v).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{s}"'
+
+
+def _toml_read(path: Path) -> dict:
+    """Read a TOML file into a dict.  Returns {} if the file does not exist."""
+    if not path.exists():
+        return {}
+    try:
+        import tomllib  # Python 3.11+
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except ImportError:
+        pass
+    # Simple line-by-line fallback for the flat per-section format we write.
+    result: dict = {}
+    current: dict | None = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            inner = line[1:-1].strip()
+            if inner.startswith('"') and inner.endswith('"'):
+                inner = inner[1:-1]
+            current = {}
+            result[inner] = current
+        elif "=" in line and current is not None:
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip()
+            if v.startswith('"') and v.endswith('"'):
+                v = v[1:-1]
+            elif v == "true":
+                v = True  # type: ignore[assignment]
+            elif v == "false":
+                v = False  # type: ignore[assignment]
+            else:
+                try:
+                    v = int(v)  # type: ignore[assignment]
+                except ValueError:
+                    try:
+                        v = float(v)  # type: ignore[assignment]
+                    except ValueError:
+                        pass
+            current[k] = v
+    return result
+
+
+def _toml_append(path: Path, section: str, data: dict) -> None:
+    """Append a [section] block to a TOML file.  No-op if section already exists."""
+    existing = _toml_read(path)
+    if section in existing:
+        logger.info("security_info: %s already present in %s — skipping", section, path)
+        return
+    # Quote section key when it contains TOML special characters (:, !, ., etc.)
+    needs_quote = any(c in section for c in ':!.[] "\\')
+    header = f'["{section}"]' if needs_quote else f"[{section}]"
+    lines = [header]
+    for k, v in data.items():
+        lines.append(f"{k} = {_toml_value(v)}")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n\n")
+
 
 class TvDatafeed:
     __sign_in_url = 'https://www.tradingview.com/accounts/signin/'
@@ -367,26 +457,39 @@ document.getElementById('f').onsubmit=function(e){
             # macOS: Keychain password → PBKDF2 → AES-128-CBC
             if not encrypted_value.startswith(b"v10"):
                 return None
-            try:
-                password = subprocess.check_output(
-                    ["security", "find-generic-password", "-w", "-s", "Chrome Safe Storage", "-a", "Chrome"],
-                    stderr=subprocess.DEVNULL,
-                ).decode().strip()
-            except Exception:
-                # Try other browser names for the keychain entry
-                for app_name in ("Chromium", "Microsoft Edge", "Brave", "Arc"):
+
+            # Use cached key if available — avoids repeated Keychain auth dialogs
+            # across multiple browser fixtures in the same process.
+            key: bytes | None = None
+            for _service in ("Chrome Safe Storage", "Chromium Safe Storage",
+                             "Microsoft Edge Safe Storage", "Brave Safe Storage", "Arc Safe Storage"):
+                if _service in _chromium_key_cache:
+                    key = _chromium_key_cache[_service]
+                    break
+
+            if key is None:
+                # No cached key — query Keychain (may show authorization dialog once)
+                password: str | None = None
+                for app_name, svc in (
+                    ("Chrome",         "Chrome Safe Storage"),
+                    ("Chromium",       "Chromium Safe Storage"),
+                    ("Microsoft Edge", "Microsoft Edge Safe Storage"),
+                    ("Brave",          "Brave Safe Storage"),
+                    ("Arc",            "Arc Safe Storage"),
+                ):
                     try:
                         password = subprocess.check_output(
-                            ["security", "find-generic-password", "-w", "-s", f"{app_name} Safe Storage", "-a", app_name],
+                            ["security", "find-generic-password", "-w", "-s", svc, "-a", app_name],
                             stderr=subprocess.DEVNULL,
                         ).decode().strip()
+                        key = hashlib.pbkdf2_hmac("sha1", password.encode(), b"saltysalt", 1003, dklen=16)
+                        _chromium_key_cache[svc] = key  # cache for subsequent calls
+                        logger.debug("cached Keychain key for '%s'", svc)
                         break
                     except Exception:
                         continue
-                else:
+                if key is None:
                     return None
-
-            key = hashlib.pbkdf2_hmac("sha1", password.encode(), b"saltysalt", 1003, dklen=16)
             ciphertext = encrypted_value[3:]  # strip 'v10'
             iv = b" " * 16
             # Use openssl for AES decryption (avoids requiring `cryptography` package)
@@ -752,6 +855,19 @@ function doCancel(){
                         if isinstance(pkt, dict) and pkt.get("m") == "protocol_error":
                             err_msg = pkt.get("p", [""])[0] if pkt.get("p") else ""
                             logger.error("TradingView auth failed: %s", err_msg)
+                            # Before interactive recovery, check whether another
+                            # process/fixture already wrote a fresh token to the file.
+                            try:
+                                if token_path.exists():
+                                    _cached = token_path.read_text().strip()
+                                    if _cached and _cached != "unauthorized_user_token" and _cached != self.token:
+                                        logger.info("retrying with file-cached token (skipping interactive recovery)")
+                                        self.token = _cached
+                                        self.ws.close()
+                                        self.__create_connection()
+                                        return self.__check_auth()
+                            except Exception:
+                                pass
                             self.__delete_token()
                             if self.__try_recover_token_from_desktop() or self.__try_recover_token_via_browser_login():
                                 self.ws.close()
@@ -839,14 +955,13 @@ function doCancel(){
                     continue
 
         if not data:
-            logger.error("no data, please check the exchange and symbol")
+            logger.debug("no data returned — symbol may be invalid or connection was lost")
             return pd.DataFrame()
 
         columns = ["datetime", "open", "high", "low", "close", "volume", "OI"]
         df = pd.DataFrame(data, columns=columns).set_index("datetime")
         if not has_oi:
             df = df.drop(columns=["OI"])
-        df.insert(0, "symbol", value=symbol)
         return df
 
     @staticmethod
@@ -885,16 +1000,29 @@ function doCancel(){
         extended_session: bool = False,
         chunk_days: int | None = None,  # Auto-calculated from account type & interval if not set
         sleep_seconds: int = 3,     # ← sleep between chunks to stay under rate limits
+        backadjusted: bool = False,  # B-ADJ: back-adjusted prices for continuous futures only
     ) -> pd.DataFrame:
         """
         If start_date/end_date are given → date-range mode with automatic chunking.
         Otherwise falls back to original n_bars behaviour.
+        backadjusted=True applies back-adjustment via TradingView's "backadjusted" adjustment mode.
+        Only valid for continuous futures symbols (e.g. CBOT:ZC1!); silently ignored for others.
         """
         plan_label = self.pro_plan if self.pro_plan else "free"
         max_bars = self._PLAN_BAR_LIMITS.get(self.pro_plan, 5_000)
         if self.token == "unauthorized_user_token":
             plan_label = "nologin"
-        logger.info("account: %s | max bars/query: %s", plan_label, f"{max_bars:,}")
+        _log_print("account: %s | max bars/query: %s", plan_label, f"{max_bars:,}")
+
+        # Validate backadjusted: only meaningful for continuous futures (symbol ends with "!")
+        _sym_check = f"{exchange}:{symbol}{fut_contract}!" if fut_contract else symbol
+        _is_continuous = _sym_check.endswith("!")
+        if backadjusted and not _is_continuous:
+            logger.warning("backadjusted=True ignored — not a continuous futures symbol (must end with '!')")
+            backadjusted = False
+        if backadjusted:
+            _log_print("B-ADJ mode enabled")
+        adjustment = "splits"  # equity split/dividend adjustment — always "splits" for futures
 
         if start_date is None and end_date is None:
             # ==================== ORIGINAL n_bars MODE (unchanged) ====================
@@ -913,8 +1041,11 @@ function doCancel(){
                                                      "type", "update_mode", "volume", "currency_code", "rchp", "rtc"])
             self.__send_message("quote_add_symbols", [self.session, symbol, {"flags": ["force_permission"]}])
             self.__send_message("quote_fast_symbols", [self.session, symbol])
-            self.__send_message("resolve_symbol", [self.chart_session, "symbol_1",
-                                                   f'={{"symbol":"{symbol}","adjustment":"splits","session":"{"regular" if not extended_session else "extended"}"}}'])
+            _resolve = f'{{"symbol":"{symbol}","adjustment":"splits","session":"{"regular" if not extended_session else "extended"}"'
+            if backadjusted:
+                _resolve += ',"backadjustment":"default"'
+            _resolve += "}"
+            self.__send_message("resolve_symbol", [self.chart_session, "symbol_1", f"={_resolve}"])
             self.__send_message("create_series", [self.chart_session, "s1", "s1", "symbol_1", interval_val, n_bars])
             self.__send_message("switch_timezone", [self.chart_session, "exchange"])
 
@@ -931,7 +1062,7 @@ function doCancel(){
                         logger.error("invalid symbol: %s — check exchange and symbol name on TradingView", symbol)
                         break
                 except Exception as e:
-                    logger.error(e)
+                    logger.debug("connection interrupted during recv: %s", e)
                     break
             self.ws.close()
             packets = self.__parse_ws_packets(raw_data)
@@ -969,21 +1100,18 @@ function doCancel(){
 
         # Auto-calculate chunk_days from account bar limit and interval
         if chunk_days is None:
-            safe_bars = int(max_bars * 0.8)
+            safe_bars = int(max_bars * 0.99)
             interval_secs = INTERVAL_SECONDS.get(interval_val, 86400)
             chunk_days = max(1, (safe_bars * interval_secs) // 86400)
-            logger.info("auto chunk size: %d calendar days per chunk (based on %s safe bars limit, %s interval)",
-                        chunk_days, f"{safe_bars:,}", interval_val)
+            _log_print("auto chunk size: %d calendar days per chunk (based on %s safe bars limit, %s interval)",
+                       chunk_days, f"{safe_bars:,}", interval_val)
 
         total_days = (end_date - start_date).days
         n_chunks = max(1, -(-total_days // chunk_days))  # ceiling division
-        secs_per_chunk = 5 + sleep_seconds  # ~5s websocket overhead + sleep
-        est_total = n_chunks * secs_per_chunk
-        est_min, est_sec = divmod(est_total, 60)
-        logger.info(
-            "date range: %s → %s (%d calendar days, %d chunks × %d days/chunk) | est. time: %dm %ds",
+        _log_print(
+            "date range: %s → %s (%d calendar days, %d chunks)",
             start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"),
-            total_days, n_chunks, chunk_days, est_min, est_sec,
+            total_days, n_chunks,
         )
 
         df_list = []
@@ -1004,16 +1132,20 @@ function doCancel(){
                 end_ts   -= 1_800_000
 
             range_str = f"r,{start_ts}:{end_ts}"
-            logger.info("chunk %d/%d: %s → %s", chunk_num, n_chunks,
-                        current_start.strftime("%Y-%m-%d"), current_end.strftime("%Y-%m-%d"))
+            _log_print("chunk %d/%d: %s → %s", chunk_num, n_chunks,
+                       current_start.strftime("%Y-%m-%d"), current_end.strftime("%Y-%m-%d"))
 
             df_chunk = pd.DataFrame()
             for attempt in range(1, 4):  # up to 3 attempts per chunk
-                df_chunk = self._fetch_range(symbol_formatted, interval_val, range_str, extended_session)
+                result = self._fetch_range(symbol_formatted, interval_val, range_str, extended_session, backadjusted)
+                if result is None:  # fatal symbol error — stop immediately, no retry
+                    logger.warning("stopping chunked download: symbol error on chunk %d/%d", chunk_num, n_chunks)
+                    return pd.DataFrame()
+                df_chunk = result
                 if not df_chunk.empty:
                     break
                 if attempt < 3:
-                    retry_delay = sleep_seconds * attempt
+                    retry_delay = max(10, sleep_seconds) * attempt
                     logger.warning(
                         "chunk %d/%d returned no data (attempt %d/3) — "
                         "retrying in %ds",
@@ -1053,22 +1185,177 @@ function doCancel(){
                     # US market: 6.5 hours/day = 390 minutes
                     bars_per_day = int((6.5 * 3600) / interval_secs)
                     est_bars = est_trading_days * bars_per_day
-                    logger.info("received %d bars (%s → %s) | est. %s trading days × %d bars/day ≈ %s expected (limited by account)",
-                                len(df),
-                                df.index[0].strftime("%Y-%m-%d"),
-                                df.index[-1].strftime("%Y-%m-%d"),
-                                f"{est_trading_days:,}", bars_per_day, f"{est_bars:,}")
+                    _log_print("received %d bars (%s → %s) | est. %s trading days × %d bars/day ≈ %s expected (limited by account)",
+                               len(df),
+                               df.index[0].strftime("%Y-%m-%d"),
+                               df.index[-1].strftime("%Y-%m-%d"),
+                               f"{est_trading_days:,}", bars_per_day, f"{est_bars:,}")
                 else:  # daily or higher
-                    logger.info("received %d bars (%s → %s) | est. %s trading days expected",
-                                len(df),
-                                df.index[0].strftime("%Y-%m-%d"),
-                                df.index[-1].strftime("%Y-%m-%d"),
-                                f"{est_trading_days:,}")
+                    _log_print("received %d bars (%s → %s) | est. %s trading days expected",
+                               len(df),
+                               df.index[0].strftime("%Y-%m-%d"),
+                               df.index[-1].strftime("%Y-%m-%d"),
+                               f"{est_trading_days:,}")
             return df
         return pd.DataFrame()
 
-    def _fetch_range(self, symbol: str, interval: str, range_str: str, extended_session: bool = False) -> pd.DataFrame:
-        """Internal helper that fetches one chunk using the range request."""
+    def get_security_info(
+        self,
+        symbol: str,
+        exchange: str = "NSE",
+        fut_contract: int | None = None,
+        toml_path: str | Path | None = None,
+    ) -> dict:
+        """Fetch symbol metadata from the TradingView WebSocket API.
+
+        Sends a quote + resolve_symbol handshake and collects all fields
+        returned in ``symbol_resolved`` and ``qsd`` responses into a flat dict.
+
+        Args:
+            symbol:       Symbol ticker (e.g. ``"AAPL"``, ``"ZC"``).
+            exchange:     Exchange code (e.g. ``"NASDAQ"``, ``"CBOT"``).
+            fut_contract: Continuous-futures contract number (1 = front month).
+            toml_path:    Optional path to a TOML file.  If supplied, the
+                          symbol's info is appended as a new section; existing
+                          symbols are silently skipped (no duplicate writes).
+
+        Returns:
+            dict of security info fields, or ``{}`` on error.
+        """
+        symbol_formatted = self.__format_symbol(symbol, exchange, fut_contract)
+
+        # Derive TOML section key as a filesystem-safe filename stem:
+        # "EXCHANGE:SYMBOL!" → "SYMBOL_EXCHANGE"  (matches the csv naming pattern)
+        _parts = symbol_formatted.split(":", 1)
+        _toml_key = (
+            f"{_parts[1].rstrip('!')}_{_parts[0]}" if len(_parts) == 2
+            else symbol_formatted.rstrip("!")
+        )
+
+        # Return cached entry without a network call if already stored.
+        if toml_path is not None:
+            cached = _toml_read(Path(toml_path))
+            if _toml_key in cached:
+                logger.info("security_info: returning cached entry for %s from %s", _toml_key, toml_path)
+                return cached[_toml_key]
+
+        # Fields needed to populate the Security Info panel.
+        _info_fields = [
+            "description", "exchange", "listed_exchange", "type", "currency_code",
+            "pricescale", "minmov", "pointvalue", "current_contract",
+            "sector", "industry", "isin", "cusip", "figi", "url",
+        ]
+
+        self.session = self.__generate_session()
+        self.chart_session = self.__generate_chart_session()
+        self.ws = create_connection(
+            "wss://data.tradingview.com/socket.io/websocket",
+            headers=self.__ws_headers, timeout=15,
+        )
+        if not self.__check_auth():
+            self.ws.close()
+            return {}
+
+        self.__send_message("chart_create_session", [self.chart_session, ""])
+        self.__send_message("quote_create_session", [self.session])
+        self.__send_message("quote_set_fields", [self.session] + _info_fields)
+        self.__send_message("quote_add_symbols", [self.session, symbol_formatted, {"flags": ["force_permission"]}])
+        self.__send_message("quote_fast_symbols", [self.session, symbol_formatted])
+        _resolve = f'{{"symbol":"{symbol_formatted}","adjustment":"splits","session":"regular"}}'
+        self.__send_message("resolve_symbol", [self.chart_session, "symbol_1", f"={_resolve}"])
+        # create_series with 2 bars triggers the symbol_resolved response and series_completed.
+        self.__send_message("create_series", [self.chart_session, "s1", "s1", "symbol_1", "1D", 2])
+
+        raw_data = ""
+        for _ in range(50):
+            try:
+                result = self.ws.recv()
+                raw_data += result + "\n"
+                if "series_completed" in result:
+                    break
+                if "symbol_error" in result:
+                    logger.error("invalid symbol: %s — check exchange and symbol name on TradingView", symbol_formatted)
+                    break
+            except Exception as e:
+                logger.debug("connection interrupted during get_security_info recv: %s", e)
+                break
+        self.ws.close()
+
+        # ── Parse response packets ────────────────────────────────────────
+        _RESOLVED_KEYS = (
+            "description", "exchange", "listed_exchange", "type",
+            "currency_code", "pricescale", "minmov", "minmove2",
+            "pointvalue", "current_contract",
+            "sector", "industry", "isin", "cusip", "figi", "url",
+        )
+        _QSD_KEYS = (
+            "description", "exchange", "listed_exchange", "type", "currency_code",
+            "pricescale", "minmov", "pointvalue", "current_contract",
+            "sector", "industry", "isin", "cusip", "figi", "url",
+        )
+
+        info: dict = {}
+        for packet in self.__parse_ws_packets(raw_data):
+            if not isinstance(packet, dict):
+                continue
+            m = packet.get("m", "")
+            p = packet.get("p", [])
+
+            if m == "symbol_resolved" and len(p) >= 3:
+                sym_data = p[2]
+                if isinstance(sym_data, dict):
+                    for key in _RESOLVED_KEYS:
+                        if key in sym_data:
+                            info[key] = sym_data[key]
+
+            elif m == "qsd" and len(p) >= 2:
+                qsd_payload = p[1]
+                if isinstance(qsd_payload, dict):
+                    v = qsd_payload.get("v", {})
+                    if isinstance(v, dict):
+                        for key in _QSD_KEYS:
+                            if key in v:
+                                info.setdefault(key, v[key])  # don't overwrite resolved data
+
+        if not info:
+            logger.warning("no security info returned for %s", symbol_formatted)
+            return {}
+
+        # ── Build curated output (matches TradingView Security Info panel) ─
+        result: dict = {"symbol": symbol_formatted}
+        for fld in ("description", "type", "listed_exchange", "exchange", "currency_code"):
+            if fld in info:
+                result[fld] = info[fld]
+        # Futures-specific: current front contract
+        if "current_contract" in info:
+            result["current_contract"] = info["current_contract"]
+        # Stock-specific identifiers
+        for fld in ("sector", "industry", "isin", "cusip", "figi", "url"):
+            if fld in info:
+                result[fld] = info[fld]
+        # Point value (dollar value per full point move)
+        if "pointvalue" in info:
+            result["point_value"] = info["pointvalue"]
+        # Tick size = minimum price increment
+        _minmov = info.get("minmov", 1) or 1
+        _pricescale = info.get("pricescale", 1) or 1
+        result["tick_size"] = _minmov / _pricescale
+
+        if toml_path is not None:
+            toml_path = Path(toml_path)
+            toml_path.parent.mkdir(parents=True, exist_ok=True)
+            _toml_append(toml_path, _toml_key, result)
+            _log_print("security info for %s written to %s", _toml_key, toml_path)
+
+        return result
+
+    def _fetch_range(self, symbol: str, interval: str, range_str: str, extended_session: bool = False, backadjusted: bool = False) -> pd.DataFrame | None:
+        """Internal helper that fetches one chunk using the range request.
+
+        Returns:
+            DataFrame  — data (possibly empty on transient connection failure, retry is OK)
+            None       — fatal symbol error, do not retry
+        """
         self.session = self.__generate_session()
         self.chart_session = self.__generate_chart_session()
         self.ws = create_connection(
@@ -1086,10 +1373,13 @@ function doCancel(){
                                                  "type", "update_mode", "volume", "currency_code", "rchp", "rtc"])
         self.__send_message("quote_add_symbols", [self.session, symbol, {"flags": ["force_permission"]}])
         self.__send_message("quote_fast_symbols", [self.session, symbol])
-        self.__send_message("resolve_symbol", [self.chart_session, "symbol_1",
-                                               f'={{"symbol":"{symbol}","adjustment":"splits","session":"{"regular" if not extended_session else "extended"}"}}'])
+        _resolve = f'{{"symbol":"{symbol}","adjustment":"splits","session":"{"regular" if not extended_session else "extended"}"'
+        if backadjusted:
+            _resolve += ',"backadjustment":"default"'
+        _resolve += "}"
+        self.__send_message("resolve_symbol", [self.chart_session, "symbol_1", f"={_resolve}"])
 
-        max_bars = int(self._PLAN_BAR_LIMITS.get(self.pro_plan, 5_000) * 0.8)
+        max_bars = int(self._PLAN_BAR_LIMITS.get(self.pro_plan, 5_000) * 0.99)
         self.__send_message("create_series", [self.chart_session, "s1", "s1", "symbol_1", interval, max_bars, range_str])
         self.__send_message("switch_timezone", [self.chart_session, "exchange"])
 
@@ -1103,10 +1393,14 @@ function doCancel(){
                 if "series_completed" in result:  # ty:ignore[unsupported-operator]
                     break
                 if "symbol_error" in result:  # ty:ignore[unsupported-operator]
-                    logger.error("invalid symbol: %s — check exchange and symbol name on TradingView", symbol)
-                    break
+                    if backadjusted:
+                        logger.error("B-ADJ not supported for %s — symbol_error from TradingView", symbol)
+                    else:
+                        logger.error("invalid symbol: %s — check exchange and symbol name on TradingView", symbol)
+                    self.ws.close()
+                    return None  # fatal: do not retry
             except Exception as e:
-                logger.error(e)
+                logger.debug("connection interrupted during _fetch_range recv: %s", e)
                 break
         self.ws.close()
         packets = self.__parse_ws_packets(raw_data)
@@ -1146,7 +1440,7 @@ if __name__ == "__main__":
         end_date=dt.now(),
         fut_contract=1,
         extended_session=True,
-        sleep_seconds=3,
+        sleep_seconds=10,
     )
 
     print(df)

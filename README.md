@@ -99,6 +99,52 @@ tv.search_symbol('CRUDE','MCX')
 
 ---
 
+## Security Info
+
+Use `tv.get_security_info` to fetch symbol metadata from TradingView (description, type, tick size, point value, and more).
+
+```python
+info = tv.get_security_info(symbol='AAPL', exchange='NASDAQ')
+# {'symbol': 'NASDAQ:AAPL', 'description': 'Apple Inc.', 'type': 'stock', 'tick_size': 0.01, 'point_value': 1.0, ...}
+
+# Futures continuous contract
+info = tv.get_security_info(symbol='ES', exchange='CME_MINI', fut_contract=1)
+# {'symbol': 'CME_MINI:ES1!', 'description': 'E-Mini S&P 500', 'type': 'futures', 'tick_size': 0.25, 'point_value': 50.0, ...}
+```
+
+Optionally cache results to a TOML file. Subsequent calls for the same symbol return the cached entry without a network request:
+
+```python
+info = tv.get_security_info('AAPL', 'NASDAQ', toml_path='data/security_info.toml')
+info = tv.get_security_info('ZC', 'CBOT', fut_contract=1, toml_path='data/security_info.toml')
+```
+
+The TOML file uses `SYMBOL_EXCHANGE` section keys (e.g. `[AAPL_NASDAQ]`, `[ZC1_CBOT]`):
+
+```toml
+[AAPL_NASDAQ]
+symbol = "NASDAQ:AAPL"
+description = "Apple Inc."
+type = "stock"
+exchange = "NASDAQ"
+currency_code = "USD"
+isin = "US0378331005"
+point_value = 1.0
+tick_size = 0.01
+
+[ZC1_CBOT]
+symbol = "CBOT:ZC1!"
+description = "Corn Futures"
+type = "futures"
+exchange = "CBOT"
+currency_code = "USD"
+current_contract = "ZCH2026"
+point_value = 50.0
+tick_size = 0.25
+```
+
+---
+
 ## Calculating Indicators
 
 Indicators data is not downloaded from tradingview. For that you can use [TA-Lib](https://github.com/mrjbq7/ta-lib). Check out this video for installation and usage instructions-
@@ -246,14 +292,13 @@ Following timeframes intervals are supported-
 
 ## Recent Changes (by Claude, Anthropic's AI Assistant)
 
-The following improvements were made to address TradingView API changes and improve reliability:
-
 ### Automatic Token Recovery
 
-When the auth token expires or fails, the library now recovers automatically without any manual steps:
+When the auth token expires or fails, the library recovers automatically:
 
-1. **Desktop app auto-extract** — If the TradingView desktop app is installed and signed in, cookies are read directly from its local SQLite database (with user permission via `[y/N]` prompt)
-2. **Browser login flow** — If the desktop app isn't available, a local web page opens with a "Log in to TradingView" button. After you sign in on tradingview.com, the library auto-detects your session by polling all browser cookie stores and connects automatically
+1. **File-cache check** — if `~/.tvdatafeed/token` already contains a fresh token (written by another instance), retries silently without any prompt
+2. **Desktop app auto-extract** — reads TradingView desktop app cookies directly (with `[y/N]` prompt)
+3. **Browser login flow** — opens a local web page; after you sign in on tradingview.com, the session is detected automatically
 
 No manual cookie copying or DevTools required.
 
@@ -264,48 +309,51 @@ Session cookies are automatically discovered from all major browsers:
 - **TradingView desktop app** (Electron, plaintext SQLite)
 - **Firefox** (plaintext SQLite, handles locked DB by copying to temp file)
 - **Safari** (macOS binary cookie format parser)
-- **Chromium-based browsers**: Chrome, Edge, Brave, Arc, Chromium (encrypted cookies with platform-specific decryption — macOS Keychain/PBKDF2/AES, Windows DPAPI, Linux PBKDF2)
+- **Chromium-based browsers**: Chrome, Edge, Brave, Arc, Chromium (encrypted cookies — macOS Keychain/PBKDF2/AES cached per-process to avoid repeated auth dialogs, Windows DPAPI, Linux PBKDF2)
 
 Supports macOS, Windows, and Linux.
-
-### Subscription Level Detection
-
-During token recovery, the library detects your TradingView plan (`pro`, `pro_premium`, or free) and reports it. Access via `tv.pro_plan` after initialization.
 
 ### Date-Range Mode with Automatic Chunking
 
 ```python
 df = tv.get_hist(
     symbol='ES', exchange='CME_MINI', interval=Interval.in_daily,
-    start_date='2025-01-01', end_date='2025-12-31',
-    fut_contract=1, chunk_days=180, sleep_seconds=3,
+    start_date='2020-01-01', end_date='2025-01-01',
+    fut_contract=1,
 )
 ```
 
-Fetches historical data across a date range by splitting into chunks to stay within TradingView limits. Handles deduplication and sorting automatically.
+Fetches historical data across any date range by automatically splitting into chunks sized to your account's bar limit (99% of plan limit). Deduplication and sorting handled automatically.
+
+### Back-Adjusted Futures
+
+```python
+# Standard (unadjusted) continuous contract
+df = tv.get_hist('ZC', 'CBOT', Interval.in_daily,
+                 start_date='2020-01-01', end_date='2025-01-01',
+                 fut_contract=1, backadjusted=False)
+
+# Back-adjusted prices (account tier dependent)
+df = tv.get_hist('ZC', 'CBOT', Interval.in_daily,
+                 start_date='2020-01-01', end_date='2025-01-01',
+                 fut_contract=1, backadjusted=True)
+```
+
+Passing `backadjusted=True` on a non-futures symbol logs a warning and is silently ignored.
 
 ### Authentication
 
-- **Token caching**: Auth token is saved to `~/.tvdatafeed/token` and reused on subsequent runs
-- **2FA support**: TOTP, SMS, and email-based two-factor authentication with a browser-based popup dialog for code entry
+- **Token caching**: Auth token saved to `~/.tvdatafeed/token` and reused on subsequent runs
+- **2FA support**: TOTP, SMS, and email-based two-factor authentication with browser-based popup
 - **Rate limit retry**: Exponential backoff when TradingView rate-limits login requests
-
-### WebSocket Parser Rewrite
-
-- **JSON-based parsing**: Proper `~m~` frame splitting and `json.loads` parsing instead of fragile regex string splitting
-- **Symbol error detection**: Invalid symbols (e.g. wrong exchange) now produce a clear error instead of silently timing out
+- **Subscription detection**: Plan (`pro`, `pro_premium`, or free) detected on login, accessible via `tv.pro_plan`
 
 ### Open Interest Support
 
-Open Interest data is automatically included in the DataFrame (as `OI` column) when returned by TradingView (e.g., futures contracts). Omitted for instruments that don't report it.
+Open Interest data is automatically included as an `OI` column when returned by TradingView (futures contracts). Omitted for instruments that don't report it.
 
-### Bug Fixes
+### Running Tests
 
-- Fixed symbol formatting: `CME_MINI:ES1!` is the correct exchange for E-mini S&P 500 futures (not `CME`)
-- Fixed `SyntaxWarning` from invalid regex escape sequences
-- Fixed `autht_oken` typo causing signin failures
-
-### PyTest Auth Checks
 ```bash
 python -m pytest tests/ -v --timeout=900
 ```

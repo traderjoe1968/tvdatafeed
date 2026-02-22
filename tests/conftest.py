@@ -15,13 +15,26 @@ from tvDatafeed.main import TvDatafeed
 
 logger = logging.getLogger("tvdatafeed.tests")
 
+# In-memory token cache — shared across all fixtures in one test run so that
+# only the first expired-session recovery opens a browser login prompt.
+_jwt_memory_cache: tuple[str, str] | None = None  # (jwt, pro_plan)
+
 # Estimated seconds per test, keyed by substrings in the test node ID.
 # Order matters: first match wins.
 _ESTIMATES = [
-    ("5min_1yr",  "~90s  (intraday chunks, 1 year)"),
-    ("15min_2yr", "~120s (intraday chunks, 2 years)"),
-    ("daily_5yr", "~15s  (single daily chunk)"),
-    ("daily_3yr", "~10s  (single daily chunk)"),
+    ("5min_1yr",                       "~90s  (intraday chunks, 1 year)"),
+    ("15min_2yr",                      "~120s (intraday chunks, 2 years)"),
+    ("daily_3yr",                      "~10s  (single daily chunk)"),
+    ("daily_18yr",                     "~30s  (chunked daily, 18 years)"),
+    ("auth_works",                     "~5s   (n_bars=10, auth check only)"),
+    ("zc1_badj_prices_differ",         "~30s  (adj download + optional raw CSV load)"),
+    ("zc1_not_backadjusted",           "~15s  (ZC1! unadjusted, saves CSV)"),
+    ("zc1_backadjusted",               "~15s  (ZC1! B-ADJ, saves CSV)"),
+    ("aapl_backadjusted_flag_ignored", "~5s   (n_bars mode, warning check)"),
+    ("zc1_security_info",             "~10s  (single quote handshake)"),
+    ("aapl_security_info",            "~10s  (single quote handshake)"),
+    ("toml_write_zc1_and_aapl",       "~20s  (two quote handshakes)"),
+    ("toml_no_duplicate",             "~10s  (single quote handshake, second skipped)"),
 ]
 
 
@@ -161,32 +174,56 @@ function doCancel(){
 def _tv_from_cookies(cookies: dict, source: str) -> TvDatafeed:
     """Convert cookies → JWT → TvDatafeed.
 
-    If the session is expired, opens a browser login page for interactive
-    recovery instead of skipping.  This opportunistically exercises the
-    real TradingView login flow — including 2FA if the account requires it.
-    The recovered token is cached to ~/.tvdatafeed/token so subsequent
-    test fixtures (e.g. TestCachedToken) benefit automatically.
-    Skips only if the user cancels recovery.
+    Recovery priority when browser cookies are expired:
+      1. In-memory cache (another fixture already recovered this run)
+      2. File cache (~/.tvdatafeed/token from a previous run)
+      3. Browser login popup (opens once, result cached for subsequent fixtures)
+
+    Skips only if the user cancels the browser login.
     """
+    global _jwt_memory_cache
+
     jwt, pro_plan = TvDatafeed._cookies_to_jwt(cookies)
     if not jwt:
-        result = _recover_via_browser_login(source)
-        if result is None:
-            pytest.skip(
-                f"{source} has TradingView cookies but session is expired — "
-                f"recovery was cancelled"
+        # 1. Reuse an already-recovered token from this test run.
+        if _jwt_memory_cache is not None:
+            jwt, pro_plan = _jwt_memory_cache
+            logger.info(
+                "reusing in-memory cached token for %s (skipping browser login)",
+                source,
             )
-        jwt, pro_plan = result
-        # Cache the recovered token so TestCachedToken and later fixtures
-        # can reuse it without another login prompt.
-        token_path = Path.home() / ".tvdatafeed" / "token"
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(jwt)
-        logger.info(
-            "recovered %s session via browser login (plan: %s) — "
-            "token cached to %s",
-            source, pro_plan or "free", token_path,
-        )
+        else:
+            # 2. Check the on-disk token written by a previous run.
+            token_path = Path.home() / ".tvdatafeed" / "token"
+            if token_path.exists():
+                cached = token_path.read_text().strip()
+                if cached and cached != "unauthorized_user_token":
+                    jwt, pro_plan = cached, ""
+                    _jwt_memory_cache = (jwt, pro_plan)
+                    logger.info(
+                        "reusing file-cached token for %s (skipping browser login)",
+                        source,
+                    )
+
+        if not jwt:
+            # 3. Last resort: open browser login once, then cache for the rest.
+            result = _recover_via_browser_login(source)
+            if result is None:
+                pytest.skip(
+                    f"{source} has TradingView cookies but session is expired — "
+                    f"recovery was cancelled"
+                )
+            jwt, pro_plan = result
+            _jwt_memory_cache = (jwt, pro_plan)
+            token_path = Path.home() / ".tvdatafeed" / "token"
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            token_path.write_text(jwt)
+            logger.info(
+                "recovered %s session via browser login (plan: %s) — "
+                "token cached to %s",
+                source, pro_plan or "free", token_path,
+            )
+
     tv = TvDatafeed(token=jwt)
     tv.pro_plan = pro_plan
     return tv
