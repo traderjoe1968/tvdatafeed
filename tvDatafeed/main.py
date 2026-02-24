@@ -38,6 +38,7 @@ def _log_print(fmt: str, *args) -> None:
     print(msg)
 
 token_path = Path.home() / ".tvdatafeed" / "token"
+pro_plan_path = Path.home() / ".tvdatafeed" / "pro_plan"
 token_path.parent.mkdir(parents=True, exist_ok=True)
 
 class Interval(enum.Enum):
@@ -176,6 +177,22 @@ class TvDatafeed:
             self.__save_token(token)
         else:
             self.token = self.__auth(username, password)
+        # Restore cached plan — populated on first desktop/browser recovery, persists across runs
+        if not self.pro_plan:
+            _cached_plan = self.__load_plan()
+            if _cached_plan:
+                self.pro_plan = _cached_plan
+                logger.info("loaded cached pro_plan: %s", _cached_plan)
+        # Still no plan — silently recover it from desktop/browser session cookies.
+        # Handles the case where pro_plan was never saved (token pre-dates plan caching).
+        if self.token and not self.pro_plan:
+            _cookies = self._read_session_cookies()
+            if _cookies:
+                _, _plan = self._cookies_to_jwt(_cookies)
+                if _plan:
+                    self.pro_plan = _plan
+                    self.__save_plan(_plan)
+                    logger.info("recovered pro_plan from session cookies: %s", _plan)
         if self.token is None:
             self.token = "unauthorized_user_token"
             logger.warning("you are using nologin method, data you access may be limited")
@@ -353,6 +370,18 @@ document.getElementById('f').onsubmit=function(e){
     def __delete_token():
         token_path.unlink(missing_ok=True)
         logger.info("deleted cached auth token")
+
+    @staticmethod
+    def __save_plan(pro_plan: str) -> None:
+        pro_plan_path.write_text(pro_plan)
+        logger.info("saved pro_plan '%s' to %s", pro_plan, pro_plan_path)
+
+    @staticmethod
+    def __load_plan() -> str:
+        try:
+            return pro_plan_path.read_text().strip()
+        except (IOError, OSError):
+            return ""
 
     # ── Cookie store paths (platform-specific) ──────────────────────────
 
@@ -703,6 +732,7 @@ document.getElementById('f').onsubmit=function(e){
             self.token = jwt
             self.pro_plan = pro_plan
             self.__save_token(jwt)
+            self.__save_plan(pro_plan)
             logger.info("using token from TradingView desktop app (plan: %s)", plan_label)
             return True
         return False
@@ -827,6 +857,7 @@ function doCancel(){
             self.token = jwt
             self.pro_plan = pro_plan
             self.__save_token(jwt)
+            self.__save_plan(pro_plan)
             plan_label = pro_plan if pro_plan else "free (non-pro)"
             logger.info("token recovered via browser login (plan: %s)", plan_label)
             return True
