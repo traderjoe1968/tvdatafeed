@@ -1115,19 +1115,32 @@ function doCancel(){
         symbol_formatted = self.__format_symbol(symbol, exchange, fut_contract)
         interval_val = interval.value
 
-        # Clamp start_date if it exceeds TradingView's historical depth for this interval
+        requested_start = start_date
+        requested_end = end_date
+
+        # TradingView's intraday range requests are bounded by an approximate
+        # lookback depth from the requested end.  Walk long requests backwards
+        # through those windows instead of clamping away the older data.
         max_hist_days = _INTERVAL_MAX_DAYS.get(interval_val)
+        date_windows: list[tuple[dt, dt]] = []
         if max_hist_days is not None:
-            earliest_available = end_date - timedelta(days=max_hist_days)
-            if start_date < earliest_available:
-                logger.warning(
-                    "TradingView only provides ~%d days of %s data — "
-                    "clamping start_date from %s to %s",
-                    max_hist_days, interval_val,
-                    start_date.strftime("%Y-%m-%d"),
-                    earliest_available.strftime("%Y-%m-%d"),
+            current_window_end = requested_end
+            while current_window_end > requested_start:
+                current_window_start = max(
+                    requested_start,
+                    current_window_end - timedelta(days=max_hist_days),
                 )
-                start_date = earliest_available
+                date_windows.append((current_window_start, current_window_end))
+                current_window_end = current_window_start
+            if len(date_windows) > 1:
+                _log_print(
+                    "TradingView provides ~%d days of %s data per range anchor — "
+                    "splitting requested range into %d historical windows",
+                    max_hist_days, interval_val, len(date_windows),
+                )
+            date_windows.reverse()
+        else:
+            date_windows = [(requested_start, requested_end)]
 
         # Auto-calculate chunk_days from account bar limit and interval
         if chunk_days is None:
@@ -1137,79 +1150,97 @@ function doCancel(){
             _log_print("auto chunk size: %d calendar days per chunk (based on %s safe bars limit, %s interval)",
                        chunk_days, f"{safe_bars:,}", interval_val)
 
-        total_days = (end_date - start_date).days
-        n_chunks = max(1, -(-total_days // chunk_days))  # ceiling division
+        def _ceil_days(delta: timedelta) -> int:
+            return max(1, -(-int(delta.total_seconds()) // 86400))
+
+        total_days = _ceil_days(requested_end - requested_start)
+        n_chunks = sum(
+            max(1, -(-_ceil_days(window_end - window_start) // chunk_days))
+            for window_start, window_end in date_windows
+        )
         _log_print(
             "date range: %s → %s (%d calendar days, %d chunks)",
-            start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"),
+            requested_start.strftime("%Y-%m-%d"), requested_end.strftime("%Y-%m-%d"),
             total_days, n_chunks,
         )
 
         df_list = []
-        current_start = start_date
         chunk_num = 0
         consecutive_empty = 0
 
-        while current_start < end_date:
-            current_end = min(current_start + timedelta(days=chunk_days), end_date)
-            chunk_num += 1
+        for window_num, (window_start, window_end) in enumerate(date_windows, start=1):
+            if len(date_windows) > 1:
+                _log_print(
+                    "history window %d/%d: %s → %s",
+                    window_num, len(date_windows),
+                    window_start.strftime("%Y-%m-%d"),
+                    window_end.strftime("%Y-%m-%d"),
+                )
 
-            start_ts = int(current_start.timestamp() * 1000)   # milliseconds
-            end_ts   = int(current_end.timestamp() * 1000)
+            current_start = window_start
+            while current_start < window_end:
+                current_end = min(current_start + timedelta(days=chunk_days), window_end)
+                chunk_num += 1
 
-            # optional 30-min buffer for intraday (as used in the original PR)
-            if INTERVAL_SECONDS.get(interval_val, 60) < 86400:
-                start_ts -= 1_800_000
-                end_ts   -= 1_800_000
+                start_ts = int(current_start.timestamp() * 1000)   # milliseconds
+                end_ts   = int(current_end.timestamp() * 1000)
 
-            range_str = f"r,{start_ts}:{end_ts}"
-            _log_print("chunk %d/%d: %s → %s", chunk_num, n_chunks,
-                       current_start.strftime("%Y-%m-%d"), current_end.strftime("%Y-%m-%d"))
+                # optional 30-min buffer for intraday (as used in the original PR)
+                if INTERVAL_SECONDS.get(interval_val, 60) < 86400:
+                    start_ts -= 1_800_000
+                    end_ts   -= 1_800_000
 
-            df_chunk = pd.DataFrame()
-            for attempt in range(1, 4):  # up to 3 attempts per chunk
-                result = self._fetch_range(symbol_formatted, interval_val, range_str, extended_session, backadjusted)
-                if result is None:  # fatal symbol error — stop immediately, no retry
-                    logger.warning("stopping chunked download: symbol error on chunk %d/%d", chunk_num, n_chunks)
-                    return pd.DataFrame()
-                df_chunk = result
+                range_str = f"r,{start_ts}:{end_ts}"
+                _log_print("chunk %d/%d: %s → %s", chunk_num, n_chunks,
+                           current_start.strftime("%Y-%m-%d"), current_end.strftime("%Y-%m-%d"))
+
+                df_chunk = pd.DataFrame()
+                for attempt in range(1, 4):  # up to 3 attempts per chunk
+                    result = self._fetch_range(symbol_formatted, interval_val, range_str, extended_session, backadjusted)
+                    if result is None:  # fatal symbol error — stop immediately, no retry
+                        logger.warning("stopping chunked download: symbol error on chunk %d/%d", chunk_num, n_chunks)
+                        return pd.DataFrame()
+                    df_chunk = result
+                    if not df_chunk.empty:
+                        break
+                    if attempt < 3:
+                        retry_delay = max(10, sleep_seconds) * attempt
+                        logger.warning(
+                            "chunk %d/%d returned no data (attempt %d/3) — "
+                            "retrying in %ds",
+                            chunk_num, n_chunks, attempt, retry_delay,
+                        )
+                        time.sleep(retry_delay)
+
                 if not df_chunk.empty:
-                    break
-                if attempt < 3:
-                    retry_delay = max(10, sleep_seconds) * attempt
-                    logger.warning(
-                        "chunk %d/%d returned no data (attempt %d/3) — "
-                        "retrying in %ds",
-                        chunk_num, n_chunks, attempt, retry_delay,
-                    )
-                    time.sleep(retry_delay)
+                    df_list.append(df_chunk)
+                    consecutive_empty = 0
+                else:
+                    consecutive_empty += 1
+                    logger.warning("chunk %d/%d failed after 3 attempts", chunk_num, n_chunks)
+                    if consecutive_empty >= 3:
+                        logger.warning(
+                            "%d consecutive chunks failed — stopping (likely rate limited or "
+                            "reached maximum available historical data for %s interval)",
+                            consecutive_empty, interval_val,
+                        )
+                        break
 
-            if not df_chunk.empty:
-                df_list.append(df_chunk)
-                consecutive_empty = 0
-            else:
-                consecutive_empty += 1
-                logger.warning("chunk %d/%d failed after 3 attempts", chunk_num, n_chunks)
-                if consecutive_empty >= 3:
-                    logger.warning(
-                        "%d consecutive chunks failed — stopping (likely rate limited or "
-                        "reached maximum available historical data for %s interval)",
-                        consecutive_empty, interval_val,
-                    )
-                    break
+                current_start = current_end
+                time.sleep(sleep_seconds)   # rate-limit safety
 
-            current_start = current_end
-            time.sleep(sleep_seconds)   # rate-limit safety
+            if consecutive_empty >= 3:
+                break
 
         if df_list:
             df = pd.concat(df_list)
             df = df[~df.index.duplicated(keep='first')].sort_index()
-            df = df[(df.index >= start_date) & (df.index <= end_date)]
+            df = df[(df.index >= requested_start) & (df.index <= requested_end)]
             if not df.empty:
                 # Calculate approximate trading days and expected bars for context
                 interval_secs = INTERVAL_SECONDS.get(interval_val, 86400)
                 trading_days_per_year = 252  # approximate
-                total_calendar_days = (end_date - start_date).days
+                total_calendar_days = (requested_end - requested_start).days
                 est_trading_days = int(total_calendar_days * trading_days_per_year / 365)
 
                 if interval_secs < 86400:  # intraday
