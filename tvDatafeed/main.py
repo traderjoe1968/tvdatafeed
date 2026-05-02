@@ -63,19 +63,20 @@ INTERVAL_SECONDS = {
     "1D": 86400, "1W": 604800, "1M": 2592000,
 }
 
-# Approximate maximum historical depth TradingView provides per interval.
-# These are conservative estimates — actual depth varies by symbol.
+# Calendar window sizes used to split very large intraday date ranges.
+# These do not extend TradingView's retained intraday history; the oldest
+# retrievable intraday bar is still governed by the account bar limit.
 _INTERVAL_MAX_DAYS = {
-    "1": 180,       # 1-minute:  ~6 months
-    "3": 365,       # 3-minute:  ~1 year
-    "5": 365,       # 5-minute:  ~1 year
-    "15": 730,      # 15-minute: ~2 years
-    "30": 730,      # 30-minute: ~2 years
-    "45": 730,      # 45-minute: ~2 years
-    "1H": 730,      # 1-hour:    ~2 years
-    "2H": 730,      # 2-hour:    ~2 years
-    "3H": 730,      # 3-hour:    ~2 years
-    "4H": 730,      # 4-hour:    ~2 years
+    "1": 180,       # 1-minute window:  ~6 months
+    "3": 365,       # 3-minute window:  ~1 year
+    "5": 365,       # 5-minute window:  ~1 year
+    "15": 730,      # 15-minute window: ~2 years
+    "30": 730,      # 30-minute window: ~2 years
+    "45": 730,      # 45-minute window: ~2 years
+    "1H": 730,      # 1-hour window:    ~2 years
+    "2H": 730,      # 2-hour window:    ~2 years
+    "3H": 730,      # 3-hour window:    ~2 years
+    "4H": 730,      # 4-hour window:    ~2 years
     # Daily and above: essentially unlimited (10+ years)
 }
 
@@ -1019,6 +1020,9 @@ function doCancel(){
         "": 5_000,  # free / nologin
     }
 
+    def _now(self) -> dt:
+        return dt.now()
+
     def get_hist(
         self,
         symbol: str,
@@ -1107,8 +1111,9 @@ function doCancel(){
             end_date = dt.fromisoformat(end_date.replace("Z", "+00:00"))
         if start_date is None:
             start_date = dt(2000, 1, 1)
-        if end_date is None or end_date > dt.now():
-            end_date = dt.now()
+        now = self._now()
+        if end_date is None or end_date > now:
+            end_date = now
         if start_date >= end_date:
             raise ValueError("start_date must be before end_date")
 
@@ -1118,9 +1123,37 @@ function doCancel(){
         requested_start = start_date
         requested_end = end_date
 
-        # TradingView's intraday range requests are bounded by an approximate
-        # lookback depth from the requested end.  Walk long requests backwards
-        # through those windows instead of clamping away the older data.
+        safe_bars = int(max_bars * 0.99)
+        interval_secs = INTERVAL_SECONDS.get(interval_val, 86400)
+        if interval_secs < 86400:
+            estimated_lookback = timedelta(seconds=safe_bars * interval_secs)
+            available_start = now - estimated_lookback
+            if requested_end <= available_start:
+                _log_print(
+                    "requested %s intraday range %s → %s is outside the estimated "
+                    "available window (%s → %s) for %s bars; returning empty DataFrame",
+                    interval_val,
+                    requested_start.strftime("%Y-%m-%d %H:%M"),
+                    requested_end.strftime("%Y-%m-%d %H:%M"),
+                    available_start.strftime("%Y-%m-%d %H:%M"),
+                    now.strftime("%Y-%m-%d %H:%M"),
+                    f"{safe_bars:,}",
+                )
+                return pd.DataFrame()
+            if requested_start < available_start:
+                _log_print(
+                    "requested %s intraday range exceeds estimated available data; "
+                    "trimming start from %s to %s (%s bars at this interval)",
+                    interval_val,
+                    requested_start.strftime("%Y-%m-%d %H:%M"),
+                    available_start.strftime("%Y-%m-%d %H:%M"),
+                    f"{safe_bars:,}",
+                )
+                requested_start = available_start
+
+        # Split very large intraday requests into smaller calendar windows.
+        # TradingView can still return empty data when the requested dates are
+        # older than the account's retained intraday bar history.
         max_hist_days = _INTERVAL_MAX_DAYS.get(interval_val)
         date_windows: list[tuple[dt, dt]] = []
         if max_hist_days is not None:
@@ -1134,9 +1167,10 @@ function doCancel(){
                 current_window_end = current_window_start
             if len(date_windows) > 1:
                 _log_print(
-                    "TradingView provides ~%d days of %s data per range anchor — "
-                    "splitting requested range into %d historical windows",
-                    max_hist_days, interval_val, len(date_windows),
+                    "splitting requested %s range into %d calendar windows of up to %d days",
+                    interval_val,
+                    len(date_windows),
+                    max_hist_days,
                 )
             date_windows.reverse()
         else:
@@ -1144,8 +1178,6 @@ function doCancel(){
 
         # Auto-calculate chunk_days from account bar limit and interval
         if chunk_days is None:
-            safe_bars = int(max_bars * 0.99)
-            interval_secs = INTERVAL_SECONDS.get(interval_val, 86400)
             chunk_days = max(1, (safe_bars * interval_secs) // 86400)
             _log_print("auto chunk size: %d calendar days per chunk (based on %s safe bars limit, %s interval)",
                        chunk_days, f"{safe_bars:,}", interval_val)
